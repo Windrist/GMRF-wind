@@ -28,6 +28,19 @@ struct WindVector
     }
 };
 
+/**
+ * Structure to save observation data for backup/restore during grid expansion
+ */
+struct SavedObservation
+{
+    double x_pos;
+    double y_pos;
+    double wind_speed;
+    double wind_direction;
+    double lambda;
+    bool time_invariant;
+};
+
 /** GMRF class implementing the probability map and methods for insterting new observations and update the map */
 class CGMRF_map
 {
@@ -51,6 +64,44 @@ public:
     Eigen::Vector2i map_size()
     {
         return {m_size_x, m_size_y};
+    }
+
+    /**
+     * Check if the occupancy map has changed dimensions or origin
+     * @param new_map The new occupancy grid map
+     * @return true if the map has changed and requires grid expansion/update
+     */
+    bool hasMapChanged(const nav_msgs::msg::OccupancyGrid& new_map) const;
+
+    /**
+     * Update the GMRF grid to accommodate a new occupancy map
+     * This method handles dynamic map expansion during robot exploration
+     * @param new_map The new occupancy grid map with potentially different dimensions
+     * @return true if the update was successful
+     */
+    bool updateOccupancyMap(const nav_msgs::msg::OccupancyGrid& new_map);
+
+    /**
+     * Get all active observations for backup purposes
+     * @return Vector of saved observations with world coordinates
+     */
+    std::vector<SavedObservation> getActiveObservations() const;
+
+    /**
+     * Restore observations from a saved backup
+     * @param observations Vector of saved observations
+     */
+    void restoreObservations(const std::vector<SavedObservation>& observations);
+
+    /**
+     * Get the current map bounds
+     */
+    void getMapBounds(float& x_min, float& x_max, float& y_min, float& y_max) const
+    {
+        x_min = m_x_min;
+        x_max = m_x_max;
+        y_min = m_y_min;
+        y_max = m_y_max;
     }
 
 protected:
@@ -94,6 +145,33 @@ protected:
 
     void id2cellxy(size_t id, size_t& cell_x, size_t& cell_y);
     void id2xy(size_t id, double& x, double& y);
+
+    /**
+     * Build prior factors for the GMRF
+     * This is called during initialization and after grid expansion
+     */
+    void buildPriorFactors();
+
+    /**
+     * Expand the GMRF grid to accommodate new map bounds
+     * Preserves existing wind field estimates in overlapping regions
+     * @param new_x_min New minimum x bound
+     * @param new_x_max New maximum x bound
+     * @param new_y_min New minimum y bound
+     * @param new_y_max New maximum y bound
+     * @return true if expansion was successful
+     */
+    bool expandGrid(float new_x_min, float new_x_max, float new_y_min, float new_y_max);
+
+    /**
+     * Map old cell index to new cell index after grid expansion
+     * @param old_idx Index in the old grid
+     * @param old_size_x Old grid width
+     * @param old_x_min Old minimum x bound
+     * @param old_y_min Old minimum y bound
+     * @return New cell index, or -1 if mapping failed
+     */
+    int mapOldIdxToNewIdx(size_t old_idx, size_t old_size_x, float old_x_min, float old_y_min) const;
 
     // Visualization
     void save_grmf_factor_graph(std::vector<Eigen::Triplet<double>>& Jout, std::vector<Eigen::Triplet<double>>& Aout, Eigen::VectorXd& yout);

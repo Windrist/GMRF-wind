@@ -552,6 +552,465 @@ CGMRF_map::~CGMRF_map()
 }
 
 /*---------------------------------------------------------------
+                Dynamic Map Update Methods
+  ---------------------------------------------------------------*/
+
+bool CGMRF_map::hasMapChanged(const nav_msgs::msg::OccupancyGrid& new_map) const
+{
+    // Calculate new map bounds
+    double new_x_min = new_map.info.origin.position.x;
+    double new_x_max = new_map.info.origin.position.x + new_map.info.width * new_map.info.resolution;
+    double new_y_min = new_map.info.origin.position.y;
+    double new_y_max = new_map.info.origin.position.y + new_map.info.height * new_map.info.resolution;
+
+    // Adjust to GMRF resolution
+    float adj_x_min = m_resolution * round(new_x_min / m_resolution);
+    float adj_x_max = m_resolution * round(new_x_max / m_resolution);
+    float adj_y_min = m_resolution * round(new_y_min / m_resolution);
+    float adj_y_max = m_resolution * round(new_y_max / m_resolution);
+
+    // Check if bounds have changed significantly (more than half a cell)
+    const float tolerance = m_resolution * 0.5;
+    bool bounds_changed = (std::abs(adj_x_min - m_x_min) > tolerance) ||
+                          (std::abs(adj_x_max - m_x_max) > tolerance) ||
+                          (std::abs(adj_y_min - m_y_min) > tolerance) ||
+                          (std::abs(adj_y_max - m_y_max) > tolerance);
+
+    return bounds_changed;
+}
+
+std::vector<SavedObservation> CGMRF_map::getActiveObservations() const
+{
+    std::vector<SavedObservation> saved;
+    saved.reserve(activeObs.size());
+
+    for (const auto& obs : activeObs)
+    {
+        SavedObservation s;
+        // Convert cell index back to world coordinates
+        double x, y;
+        size_t cell_x = obs.cell_idx % m_size_x;
+        size_t cell_y = obs.cell_idx / m_size_x;
+        s.x_pos = m_x_min + (cell_x * m_resolution) + (m_resolution / 2);
+        s.y_pos = m_y_min + (cell_y * m_resolution) + (m_resolution / 2);
+        s.wind_speed = sqrt(obs.windX * obs.windX + obs.windY * obs.windY);
+        s.wind_direction = atan2(obs.windY, obs.windX);
+        s.lambda = obs.lambda;
+        s.time_invariant = obs.time_invariant;
+        saved.push_back(s);
+    }
+
+    return saved;
+}
+
+void CGMRF_map::restoreObservations(const std::vector<SavedObservation>& observations)
+{
+    for (const auto& obs : observations)
+    {
+        // Check if the observation is within the new map bounds
+        if (obs.x_pos >= m_x_min && obs.x_pos < m_x_max &&
+            obs.y_pos >= m_y_min && obs.y_pos < m_y_max)
+        {
+            const int cellIdx = xy2idx(obs.x_pos, obs.y_pos);
+            if (cellIdx >= 0 && static_cast<size_t>(cellIdx) < N && is_cell_free(cellIdx))
+            {
+                TobservationGMRF new_obs;
+                new_obs.cell_idx = cellIdx;
+                new_obs.windX = obs.wind_speed * cos(obs.wind_direction);
+                new_obs.windY = obs.wind_speed * sin(obs.wind_direction);
+                new_obs.lambda = obs.lambda;
+                new_obs.time_invariant = obs.time_invariant;
+                activeObs.push_back(new_obs);
+                nObsFactors += 2;
+            }
+        }
+    }
+
+    if (verbose)
+        RCLCPP_INFO(node->get_logger(), "[GMRF] Restored %lu observations after grid update", observations.size());
+}
+
+int CGMRF_map::mapOldIdxToNewIdx(size_t old_idx, size_t old_size_x, float old_x_min, float old_y_min) const
+{
+    // Convert old index to world coordinates
+    size_t old_cell_x = old_idx % old_size_x;
+    size_t old_cell_y = old_idx / old_size_x;
+    double world_x = old_x_min + (old_cell_x * m_resolution) + (m_resolution / 2);
+    double world_y = old_y_min + (old_cell_y * m_resolution) + (m_resolution / 2);
+
+    // Convert world coordinates to new index
+    if (world_x < m_x_min || world_x >= m_x_max || world_y < m_y_min || world_y >= m_y_max)
+        return -1;
+
+    return xy2idx(world_x, world_y);
+}
+
+bool CGMRF_map::expandGrid(float new_x_min, float new_x_max, float new_y_min, float new_y_max)
+{
+    try
+    {
+        // Store old dimensions
+        size_t old_size_x = m_size_x;
+        size_t old_size_y = m_size_y;
+        size_t old_N = N;
+        float old_x_min = m_x_min;
+        float old_y_min = m_y_min;
+
+        // Store old wind field values
+        std::vector<TRandomFieldCell> old_map = m_map;
+
+        // Update dimensions
+        m_x_min = new_x_min;
+        m_x_max = new_x_max;
+        m_y_min = new_y_min;
+        m_y_max = new_y_max;
+        m_size_x = round((m_x_max - m_x_min) / m_resolution);
+        m_size_y = round((m_y_max - m_y_min) / m_resolution);
+        N = m_size_x * m_size_y;
+
+        if (verbose)
+        {
+            RCLCPP_INFO(node->get_logger(), "[GMRF] Expanding grid from (%lu,%lu) to (%lu,%lu) cells",
+                        old_size_x, old_size_y, m_size_x, m_size_y);
+            RCLCPP_INFO(node->get_logger(), "[GMRF] New bounds: x=(%.2f,%.2f) y=(%.2f,%.2f)",
+                        m_x_min, m_x_max, m_y_min, m_y_max);
+        }
+
+        // Initialize new map with zeros
+        TRandomFieldCell init_cell;
+        init_cell.mean = 0.0;
+        init_cell.std = 0.0;
+        m_map.assign(2 * N, init_cell);
+
+        // Copy old values to new positions
+        for (size_t old_idx = 0; old_idx < old_N; old_idx++)
+        {
+            int new_idx = mapOldIdxToNewIdx(old_idx, old_size_x, old_x_min, old_y_min);
+            if (new_idx >= 0 && static_cast<size_t>(new_idx) < N)
+            {
+                // Copy Wx component
+                m_map[new_idx].mean = old_map[old_idx].mean;
+                m_map[new_idx].std = old_map[old_idx].std;
+                // Copy Wy component
+                m_map[new_idx + N].mean = old_map[old_idx + old_N].mean;
+                m_map[new_idx + N].std = old_map[old_idx + old_N].std;
+            }
+        }
+
+        // Update observation cell indices
+        std::vector<TobservationGMRF> old_obs = activeObs;
+        activeObs.clear();
+        nObsFactors = 0;
+
+        for (const auto& obs : old_obs)
+        {
+            int new_idx = mapOldIdxToNewIdx(obs.cell_idx, old_size_x, old_x_min, old_y_min);
+            if (new_idx >= 0 && static_cast<size_t>(new_idx) < N)
+            {
+                TobservationGMRF new_obs = obs;
+                new_obs.cell_idx = new_idx;
+                activeObs.push_back(new_obs);
+                nObsFactors += 2;
+            }
+        }
+
+        if (verbose)
+            RCLCPP_INFO(node->get_logger(), "[GMRF] Preserved %lu observations after grid expansion", activeObs.size());
+
+        return true;
+    }
+    catch (std::exception& e)
+    {
+        RCLCPP_ERROR(node->get_logger(), "[GMRF] Exception during grid expansion: %s", e.what());
+        return false;
+    }
+}
+
+bool CGMRF_map::updateOccupancyMap(const nav_msgs::msg::OccupancyGrid& new_map)
+{
+    try
+    {
+        // Calculate new bounds
+        double new_x_min_raw = new_map.info.origin.position.x;
+        double new_x_max_raw = new_map.info.origin.position.x + new_map.info.width * new_map.info.resolution;
+        double new_y_min_raw = new_map.info.origin.position.y;
+        double new_y_max_raw = new_map.info.origin.position.y + new_map.info.height * new_map.info.resolution;
+
+        // Adjust to GMRF resolution
+        float new_x_min = m_resolution * round(new_x_min_raw / m_resolution);
+        float new_x_max = m_resolution * round(new_x_max_raw / m_resolution);
+        float new_y_min = m_resolution * round(new_y_min_raw / m_resolution);
+        float new_y_max = m_resolution * round(new_y_max_raw / m_resolution);
+
+        // Check if grid needs expansion
+        bool needs_expansion = (new_x_min < m_x_min) || (new_x_max > m_x_max) ||
+                               (new_y_min < m_y_min) || (new_y_max > m_y_max);
+
+        if (needs_expansion)
+        {
+            // Expand to encompass both old and new bounds
+            float expanded_x_min = std::min(m_x_min, new_x_min);
+            float expanded_x_max = std::max(m_x_max, new_x_max);
+            float expanded_y_min = std::min(m_y_min, new_y_min);
+            float expanded_y_max = std::max(m_y_max, new_y_max);
+
+            if (!expandGrid(expanded_x_min, expanded_x_max, expanded_y_min, expanded_y_max))
+            {
+                RCLCPP_ERROR(node->get_logger(), "[GMRF] Failed to expand grid");
+                return false;
+            }
+        }
+
+        // Update occupancy grid reference
+        m_Ocgridmap = new_map;
+
+        // Rebuild prior factors with new occupancy information
+        buildPriorFactors();
+
+        RCLCPP_INFO(node->get_logger(), "[GMRF] Occupancy map updated successfully. Grid: (%lu,%lu), %lu factors",
+                    m_size_x, m_size_y, nPriorFactors);
+
+        return true;
+    }
+    catch (std::exception& e)
+    {
+        RCLCPP_ERROR(node->get_logger(), "[GMRF] Exception updating occupancy map: %s", e.what());
+        return false;
+    }
+}
+
+void CGMRF_map::buildPriorFactors()
+{
+    // Clear existing prior factors
+    J.clear();
+    Lambda.clear();
+    line_list.points.clear();
+    line_list_obs.points.clear();
+
+    // Estimate number of factors for memory reservation
+    nPriorFactors = 2 * ((m_size_x - 1) * m_size_y + m_size_x * (m_size_y - 1));
+    J.reserve(5 * nPriorFactors);
+    Lambda.reserve(nPriorFactors);
+
+    geometry_msgs::msg::Point p;
+    p.z = 0;
+
+    size_t count = 0;
+    for (size_t j = 0; j < N; j++)
+    {
+        size_t jx, jy;
+        id2cellxy(j, jx, jy);
+
+        if (!is_cell_free(j))
+        {
+            // Force occupied cell to 0 value
+            Eigen::Triplet<double> lambda_entry(count, count, lambdaPrior_obstacles);
+            Eigen::Triplet<double> J_entry(count, j, 1);
+            Lambda.push_back(lambda_entry);
+            J.push_back(J_entry);
+            count++;
+            Eigen::Triplet<double> lambda_entry2(count, count, lambdaPrior_obstacles);
+            Eigen::Triplet<double> J_entry2(count, j + N, 1);
+            Lambda.push_back(lambda_entry2);
+            J.push_back(J_entry2);
+            count++;
+        }
+
+        // Factor with the right node: (j <--> j+1)
+        if (jx < (m_size_x - 1))
+        {
+            if (is_cell_free(j) && is_cell_free(j + 1))
+            {
+                if (check_connectivity_between2cells(j, j + 1))
+                {
+                    // Regularization factor for Wx
+                    Eigen::Triplet<double> lambda_entry(count, count, lambdaPrior_reg);
+                    Eigen::Triplet<double> J_entry1(count, j, 1);
+                    Eigen::Triplet<double> J_entry2(count, j + 1, -1);
+                    Lambda.push_back(lambda_entry);
+                    J.push_back(J_entry1);
+                    J.push_back(J_entry2);
+                    count++;
+
+                    // Regularization factor for Wy
+                    Eigen::Triplet<double> lambda_entry2(count, count, lambdaPrior_reg);
+                    Eigen::Triplet<double> J_entry3(count, j + N, 1);
+                    Eigen::Triplet<double> J_entry4(count, j + N + 1, -1);
+                    Lambda.push_back(lambda_entry2);
+                    J.push_back(J_entry3);
+                    J.push_back(J_entry4);
+                    count++;
+
+                    id2xy(j, p.x, p.y);
+                    line_list.points.push_back(p);
+                    id2xy(j + 1, p.x, p.y);
+                    line_list.points.push_back(p);
+                }
+                else
+                {
+                    // Obstacle between cells - force Wx=0
+                    Eigen::Triplet<double> lambda_entry(count, count, lambdaPrior_obstacles);
+                    Eigen::Triplet<double> J_entry(count, j, 1);
+                    Lambda.push_back(lambda_entry);
+                    J.push_back(J_entry);
+                    count++;
+
+                    Eigen::Triplet<double> lambda_entry2(count, count, lambdaPrior_obstacles);
+                    Eigen::Triplet<double> J_entry2(count, j + 1, 1);
+                    Lambda.push_back(lambda_entry2);
+                    J.push_back(J_entry2);
+                    count++;
+                }
+            }
+            else if (is_cell_free(j))
+            {
+                Eigen::Triplet<double> lambda_entry(count, count, lambdaPrior_obstacles);
+                Eigen::Triplet<double> J_entry(count, j, 1);
+                Lambda.push_back(lambda_entry);
+                J.push_back(J_entry);
+                count++;
+            }
+            else if (is_cell_free(j + 1))
+            {
+                Eigen::Triplet<double> lambda_entry(count, count, lambdaPrior_obstacles);
+                Eigen::Triplet<double> J_entry(count, j + 1, 1);
+                Lambda.push_back(lambda_entry);
+                J.push_back(J_entry);
+                count++;
+            }
+        }
+
+        // Factor with the upper node: (j <--> j+m_size_x)
+        if (jy < (m_size_y - 1))
+        {
+            if (is_cell_free(j) && is_cell_free(j + m_size_x))
+            {
+                if (check_connectivity_between2cells(j, j + m_size_x))
+                {
+                    // Regularization factor for Wx
+                    Eigen::Triplet<double> lambda_entry(count, count, lambdaPrior_reg);
+                    Eigen::Triplet<double> J_entry1(count, j, 1);
+                    Eigen::Triplet<double> J_entry2(count, j + m_size_x, -1);
+                    Lambda.push_back(lambda_entry);
+                    J.push_back(J_entry1);
+                    J.push_back(J_entry2);
+                    count++;
+
+                    // Regularization factor for Wy
+                    Eigen::Triplet<double> lambda_entry2(count, count, lambdaPrior_reg);
+                    Eigen::Triplet<double> J_entry3(count, j + N, 1);
+                    Eigen::Triplet<double> J_entry4(count, j + N + m_size_x, -1);
+                    Lambda.push_back(lambda_entry2);
+                    J.push_back(J_entry3);
+                    J.push_back(J_entry4);
+                    count++;
+
+                    id2xy(j, p.x, p.y);
+                    line_list.points.push_back(p);
+                    id2xy(j + m_size_x, p.x, p.y);
+                    line_list.points.push_back(p);
+                }
+                else
+                {
+                    // Obstacle between cells - force Wy=0
+                    Eigen::Triplet<double> lambda_entry(count, count, lambdaPrior_obstacles);
+                    Eigen::Triplet<double> J_entry(count, j + N, 1);
+                    Lambda.push_back(lambda_entry);
+                    J.push_back(J_entry);
+                    count++;
+
+                    Eigen::Triplet<double> lambda_entry2(count, count, lambdaPrior_obstacles);
+                    Eigen::Triplet<double> J_entry2(count, j + N + m_size_x, 1);
+                    Lambda.push_back(lambda_entry2);
+                    J.push_back(J_entry2);
+                    count++;
+                }
+            }
+            else if (is_cell_free(j))
+            {
+                Eigen::Triplet<double> lambda_entry(count, count, lambdaPrior_obstacles);
+                Eigen::Triplet<double> J_entry(count, j + N, 1);
+                Lambda.push_back(lambda_entry);
+                J.push_back(J_entry);
+                count++;
+            }
+            else if (is_cell_free(j + m_size_x))
+            {
+                Eigen::Triplet<double> lambda_entry(count, count, lambdaPrior_obstacles);
+                Eigen::Triplet<double> J_entry(count, j + N + m_size_x, 1);
+                Lambda.push_back(lambda_entry);
+                J.push_back(J_entry);
+                count++;
+            }
+        }
+
+        // Mass conservation factors
+        if (is_cell_free(j) && jx > 0 && jx < m_size_x - 1 && jy > 0 && jy < m_size_y - 1)
+        {
+            bool set = false;
+            if (is_cell_free(j - 1))
+            {
+                J.push_back(Eigen::Triplet<double>(count, j - 1, -1));
+                set = true;
+            }
+            if (is_cell_free(j + 1))
+            {
+                J.push_back(Eigen::Triplet<double>(count, j + 1, 1));
+                set = true;
+            }
+            if (is_cell_free(j - m_size_x))
+            {
+                J.push_back(Eigen::Triplet<double>(count, j + N - m_size_x, -1));
+                set = true;
+            }
+            if (is_cell_free(j + m_size_x))
+            {
+                J.push_back(Eigen::Triplet<double>(count, j + N + m_size_x, 1));
+                set = true;
+            }
+
+            // Diagonals
+            if (is_cell_free(j + m_size_x - 1))
+            {
+                J.push_back(Eigen::Triplet<double>(count, j + m_size_x - 1, -0.5));
+                J.push_back(Eigen::Triplet<double>(count, j + m_size_x - 1 + N, 0.5));
+                set = true;
+            }
+            if (is_cell_free(j + m_size_x + 1))
+            {
+                J.push_back(Eigen::Triplet<double>(count, j + m_size_x + 1, 0.5));
+                J.push_back(Eigen::Triplet<double>(count, j + m_size_x + 1 + N, 0.5));
+                set = true;
+            }
+            if (is_cell_free(j - m_size_x + 1))
+            {
+                J.push_back(Eigen::Triplet<double>(count, j - m_size_x + 1, 0.5));
+                J.push_back(Eigen::Triplet<double>(count, j - m_size_x + 1 + N, -0.5));
+                set = true;
+            }
+            if (is_cell_free(j - m_size_x - 1))
+            {
+                J.push_back(Eigen::Triplet<double>(count, j - m_size_x - 1, -0.5));
+                J.push_back(Eigen::Triplet<double>(count, j - m_size_x - 1 + N, -0.5));
+                set = true;
+            }
+
+            if (set)
+            {
+                Lambda.push_back(Eigen::Triplet<double>(count, count, lambdaPrior_mass_conservation));
+                count++;
+            }
+        }
+    }
+
+    nPriorFactors = count;
+    nFactors = nPriorFactors + nObsFactors;
+
+    if (verbose)
+        RCLCPP_INFO(node->get_logger(), "[GMRF] Built %lu prior factors for %lu cells", nPriorFactors, N);
+}
+
+/*---------------------------------------------------------------
                         Cell index transformations
   ---------------------------------------------------------------*/
 // Get x,y in cells (in the GMRF representation) from the general index in the array

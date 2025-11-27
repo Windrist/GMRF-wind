@@ -74,6 +74,10 @@ Cgmrf::Cgmrf()
 
     verbose = declare_parameter<bool>("verbose", false);
 
+    // Dynamic map update parameters
+    map_update_cooldown_ = declare_parameter<double>("map_update_cooldown", 5.0);  // seconds
+    last_map_update_time_ = this->now();
+
     module_init = false;
 }
 
@@ -86,9 +90,46 @@ Cgmrf::~Cgmrf()
 //--------------------------
 void Cgmrf::mapCallback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
 {
+    // Handle dynamic map updates
     if (module_init)
-        return;
+    {
+        // Check if the map has changed significantly
+        if (my_map->hasMapChanged(*msg))
+        {
+            // Apply rate limiting for map updates
+            auto now = this->now();
+            if ((now - last_map_update_time_).seconds() < map_update_cooldown_)
+            {
+                if (verbose)
+                    RCLCPP_DEBUG(get_logger(), "[GMRF] Map change detected but cooldown active (%.1fs remaining)",
+                                 map_update_cooldown_ - (now - last_map_update_time_).seconds());
+                return;
+            }
 
+            RCLCPP_INFO(get_logger(), "[GMRF] Map dimensions changed, updating GMRF grid...");
+
+            // Update the occupancy map (handles grid expansion and factor rebuilding)
+            if (my_map->updateOccupancyMap(*msg))
+            {
+                last_map_update_time_ = now;
+                RCLCPP_INFO(get_logger(), "[GMRF] Grid update completed successfully");
+            }
+            else
+            {
+                RCLCPP_ERROR(get_logger(), "[GMRF] Failed to update grid with new map");
+            }
+        }
+        else
+        {
+            // Map bounds haven't changed, but occupancy data might have
+            // Update the occupancy grid reference for obstacle checking
+            // This is a lightweight update that doesn't require grid expansion
+            my_map->updateOccupancyMap(*msg);
+        }
+        return;
+    }
+
+    // First-time initialization
     // we can choose to read a map file directly from disk, if we don't want to use the one published by map_server
     // this is often useful when we need to alter the occupancy map to include outlets, which should be empty for GMRF but which may not be navigable (think windows)
     std::string mapFilePath = declare_parameter<std::string>("map_file", "");

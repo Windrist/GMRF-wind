@@ -86,6 +86,10 @@ public:
     double GMRF_lambdaObs;     // [GMRF model] The initial information (Lambda) of each observation (this information will decrease with time)
     double GMRF_lambdaObsLoss; // [GMRF model] The loss of information (Lambda) of the observations with each iteration (see AppTick)
 
+    // Dynamic map update parameters
+    double map_update_cooldown_;      // Minimum time between map updates (seconds)
+    rclcpp::Time last_map_update_time_;  // Time of last map update
+
     // Variables
     bool module_init;
     boost::mutex mutex_anemometer;
