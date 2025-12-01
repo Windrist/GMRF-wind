@@ -1,13 +1,13 @@
+#pragma once
 
 #include "rclcpp/rclcpp.hpp"
 #include "visualization_msgs/msg/marker.hpp"
 #include "visualization_msgs/msg/marker_array.hpp"
 #include <eigen3/Eigen/Sparse>
-#include <fstream> // std::ofstream
-#include <math.h>  /* atan2 */
+#include <fstream>
+#include <cmath>
 #include <nav_msgs/msg/occupancy_grid.hpp>
 
-#define NUM_CELL_TEMPLATES 200 // For plotting only
 struct TRandomFieldCell
 {
     double mean;
@@ -45,8 +45,9 @@ struct SavedObservation
 class CGMRF_map
 {
 public:
-    CGMRF_map(rclcpp::Node* _node, const nav_msgs::msg::OccupancyGrid& oc_map, float cell_size, double m_lambdaPrior_reg,
-              double m_lambdaPrior_mass_conservation, double m_lambdaPrior_obstacles, std::string m_colormap, int max_points_cell, bool verbose);
+    CGMRF_map(rclcpp::Node *_node, const nav_msgs::msg::OccupancyGrid &oc_map, float cell_size, double m_lambdaPrior_reg,
+              double m_lambdaPrior_mass_conservation, double m_lambdaPrior_obstacles, std::string m_colormap, int max_points_cell, bool verbose,
+              bool filter_unexplored = true);
     ~CGMRF_map();
 
     // insert new observation
@@ -56,7 +57,7 @@ public:
     void updateMapEstimation_GMRF(float lambdaObsLoss);
 
     // Visualization
-    void get_as_markerArray(visualization_msgs::msg::MarkerArray& ma, std::string frame_id);
+    void get_as_markerArray(visualization_msgs::msg::MarkerArray &ma, std::string frame_id);
 
     WindVector getEstimation(int index);
     WindVector getEstimation(double x, double y);
@@ -71,7 +72,7 @@ public:
      * @param new_map The new occupancy grid map
      * @return true if the map has changed and requires grid expansion/update
      */
-    bool hasMapChanged(const nav_msgs::msg::OccupancyGrid& new_map) const;
+    bool hasMapChanged(const nav_msgs::msg::OccupancyGrid &new_map) const;
 
     /**
      * Update the GMRF grid to accommodate a new occupancy map
@@ -79,7 +80,7 @@ public:
      * @param new_map The new occupancy grid map with potentially different dimensions
      * @return true if the update was successful
      */
-    bool updateOccupancyMap(const nav_msgs::msg::OccupancyGrid& new_map);
+    bool updateOccupancyMap(const nav_msgs::msg::OccupancyGrid &new_map);
 
     /**
      * Get all active observations for backup purposes
@@ -91,12 +92,12 @@ public:
      * Restore observations from a saved backup
      * @param observations Vector of saved observations
      */
-    void restoreObservations(const std::vector<SavedObservation>& observations);
+    void restoreObservations(const std::vector<SavedObservation> &observations);
 
     /**
      * Get the current map bounds
      */
-    void getMapBounds(float& x_min, float& x_max, float& y_min, float& y_max) const
+    void getMapBounds(float &x_min, float &x_max, float &y_min, float &y_max) const
     {
         x_min = m_x_min;
         x_max = m_x_max;
@@ -105,14 +106,13 @@ public:
     }
 
 protected:
-    rclcpp::Node* node;
+    rclcpp::Node *node;
     std::vector<TRandomFieldCell> m_map;      // GMRF container of nodes
     nav_msgs::msg::OccupancyGrid m_Ocgridmap; // Occupancy gridmap of the environment
     float m_x_min, m_x_max, m_y_min, m_y_max; // dimensions (m)
     float m_resolution;                       // cell_size (m)
     size_t m_size_x, m_size_y;                // dimensions in CellNumber
     size_t N;                                 // number of cells in the GMRF (we have 2N nodes)
-    float res_coef;
     bool verbose;
 
     // GMRF
@@ -139,18 +139,28 @@ protected:
 
     // functions
     bool is_cell_free(size_t id_gmrf);
+    bool is_cell_explored(size_t id_gmrf);
     bool check_connectivity_between2cells(size_t idx_1_gmrf, size_t idx_2_gmrf);
+
+    // Filter unexplored regions flag
+    bool filter_unexplored_;
 
     int xy2idx(float x, float y) const;
 
-    void id2cellxy(size_t id, size_t& cell_x, size_t& cell_y);
-    void id2xy(size_t id, double& x, double& y);
+    void id2cellxy(size_t id, size_t &cell_x, size_t &cell_y);
+    void id2xy(size_t id, double &x, double &y);
 
     /**
      * Build prior factors for the GMRF
      * This is called during initialization and after grid expansion
+     * @param include_visualization If true, build visualization markers (line_list, line_list_obs)
      */
-    void buildPriorFactors();
+    void buildPriorFactors(bool include_visualization = false);
+
+    /**
+     * Initialize visualization markers for the factor graph
+     */
+    void initializeVisualizationMarkers();
 
     /**
      * Expand the GMRF grid to accommodate new map bounds
@@ -174,19 +184,11 @@ protected:
     int mapOldIdxToNewIdx(size_t old_idx, size_t old_size_x, float old_x_min, float old_y_min) const;
 
     // Visualization
-    void save_grmf_factor_graph(std::vector<Eigen::Triplet<double>>& Jout, std::vector<Eigen::Triplet<double>>& Aout, Eigen::VectorXd& yout);
-    void save_grmf_factor_graph(Eigen::SparseMatrix<double>& H, Eigen::VectorXd& G);
+    void save_grmf_factor_graph(std::vector<Eigen::Triplet<double>> &Jout, std::vector<Eigen::Triplet<double>> &Aout, Eigen::VectorXd &yout);
+    void save_grmf_factor_graph(Eigen::SparseMatrix<double> &H, Eigen::VectorXd &G);
     visualization_msgs::msg::Marker line_list, line_list_obs;
     void init_colormaps(std::string colormap);
     float color_r[200];
     float color_g[200];
     float color_b[200];
-
-    // pcl::PointCloud<pcl::PointXYZRGB> template_cells[NUM_CELL_TEMPLATES];
-    // void init_pcl_templates(std::string colormap, int max_points_cell);
-
-    // float                                   GMRF_lambdaPrior;		//!< The information (Lambda) of fixed map constraints
-    // std::vector<Eigen::Triplet<double> >    H_prior;        // the prior part of H
-    // Eigen::VectorXd                         g;              // Gradient vector
-    // std::multimap<size_t,size_t>            cell_interconnections;		//Store the interconnections (relations) of each cell with its neighbourds
 };

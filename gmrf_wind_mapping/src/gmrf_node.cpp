@@ -15,10 +15,8 @@
 
 #include "gmrf_node.h"
 #include "Utils.h"
-#include <chrono>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
-#include <tf2/time.h>
 
 using namespace std::placeholders;
 
@@ -75,8 +73,11 @@ Cgmrf::Cgmrf()
     verbose = declare_parameter<bool>("verbose", false);
 
     // Dynamic map update parameters
-    map_update_cooldown_ = declare_parameter<double>("map_update_cooldown", 5.0);  // seconds
+    map_update_cooldown_ = declare_parameter<double>("map_update_cooldown", 5.0); // seconds
     last_map_update_time_ = this->now();
+
+    // Filter unexplored regions parameter
+    filter_unexplored_ = declare_parameter<bool>("filter_unexplored_regions", true);
 
     module_init = false;
 }
@@ -165,8 +166,8 @@ void Cgmrf::initialize()
 
     // Create GMRF-Map and init
     my_map = std::make_unique<CGMRF_map>(this, occupancyMap, cell_size, GMRF_lambdaPrior_reg, GMRF_lambdaPrior_mass_conservation,
-                                         GMRF_lambdaPrior_obstacles, colormap, max_pclpoints_cell, verbose);
-    RCLCPP_INFO(get_logger(), "[GMRF-node] GMRF GridMap initialized");
+                                         GMRF_lambdaPrior_obstacles, colormap, max_pclpoints_cell, verbose, filter_unexplored_);
+    RCLCPP_INFO(get_logger(), "[GMRF-node] GMRF GridMap initialized (filter_unexplored=%s)", filter_unexplored_ ? "true" : "false");
 
     module_init = true;
 }
@@ -203,9 +204,9 @@ void Cgmrf::sensorCallback(const olfaction_msgs::msg::Anemometer::SharedPtr msg)
 
                 downwind_direction_map = angles::normalize_angle(Utils::getYaw(map_upWind_pose.pose.orientation) + 3.14159);
             }
-            catch (tf2::TransformException& ex)
+            catch (const tf2::TransformException &ex)
             {
-                RCLCPP_ERROR(get_logger(), "[GMRF] - %s - Error: %s", __FUNCTION__, ex.what());
+                RCLCPP_ERROR(get_logger(), "[GMRF] Transform error: %s", ex.what());
             }
         }
         else
@@ -213,9 +214,9 @@ void Cgmrf::sensorCallback(const olfaction_msgs::msg::Anemometer::SharedPtr msg)
             downwind_direction_map = 0.0;
         }
     }
-    catch (std::exception e)
+    catch (const std::exception &e)
     {
-        RCLCPP_ERROR(get_logger(), "[GMRF] Exception at new Obs: %s ", e.what());
+        RCLCPP_ERROR(get_logger(), "[GMRF] Exception at new Obs: %s", e.what());
     }
     mutex_anemometer.unlock();
     // RCLCPP_INFO(get_logger(), "[GMRF-node] New wind observation! %.2f m/s  %.2f rad (DownWind in the map ref system)",msg->wind_speed,
@@ -229,9 +230,9 @@ void Cgmrf::sensorCallback(const olfaction_msgs::msg::Anemometer::SharedPtr msg)
         // lookuptransform (target_frame, source_frame, result_tf)
         transform = tf_buffer->lookupTransform(frame_id.c_str(), msg->header.frame_id.c_str(), msg->header.stamp);
     }
-    catch (tf2::TransformException ex)
+    catch (const tf2::TransformException &ex)
     {
-        RCLCPP_ERROR(get_logger(), "[GMRF] exception when reading observation: %s", ex.what());
+        RCLCPP_ERROR(get_logger(), "[GMRF] Exception reading observation: %s", ex.what());
         know_sensor_pose = false;
     }
 
@@ -302,7 +303,7 @@ bool Cgmrf::get_wind_value_srv(WindEstimation::Request::SharedPtr req, WindEstim
 //-----------------------------------------------------------------------------
 //                                    MAIN
 //----------------------------------------------------------------------------
-int main(int argc, char** argv)
+int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
     auto my_gmrf_map = std::make_shared<Cgmrf>();

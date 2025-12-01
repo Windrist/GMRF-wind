@@ -33,18 +33,12 @@
 * KernelDM+V Implementation:  Victor Hernandez
 *********************************************************************/
 
-//-----------------------------------------------------
-// 2D Wind estimation with GMRF
-//-----------------------------------------------------
+#pragma once
+
 #include "rclcpp/rclcpp.hpp"
-#include "std_msgs/msg/float32.hpp"
-#include "nav_msgs/msg/odometry.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
-#include <sensor_msgs/msg/point_cloud2.hpp>
-#include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <boost/thread/mutex.hpp>
-#include <boost/math/constants/constants.hpp>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
 #include <angles/angles.h>
@@ -52,7 +46,6 @@
 
 #include "gmrf_map.h"
 
-// Services
 #include "gmrf_msgs/srv/wind_estimation.hpp"
 
 using WindEstimation = gmrf_msgs::srv::WindEstimation;
@@ -83,22 +76,21 @@ public:
     double GMRF_lambdaPrior_reg;               // Weight for regularization prior -> neighbour cells have similar wind vectors
     double GMRF_lambdaPrior_mass_conservation; // Weight for mass conservation law prior
     double GMRF_lambdaPrior_obstacles;         // Weight for wind close to obstacles prior -->cells close to obstacles has only tangencial wind
-    double GMRF_lambdaObs;     // [GMRF model] The initial information (Lambda) of each observation (this information will decrease with time)
-    double GMRF_lambdaObsLoss; // [GMRF model] The loss of information (Lambda) of the observations with each iteration (see AppTick)
+    double GMRF_lambdaObs;                     // [GMRF model] The initial information (Lambda) of each observation (this information will decrease with time)
+    double GMRF_lambdaObsLoss;                 // [GMRF model] The loss of information (Lambda) of the observations with each iteration (see AppTick)
 
     // Dynamic map update parameters
-    double map_update_cooldown_;      // Minimum time between map updates (seconds)
-    rclcpp::Time last_map_update_time_;  // Time of last map update
+    double map_update_cooldown_;        // Minimum time between map updates (seconds)
+    rclcpp::Time last_map_update_time_; // Time of last map update
+
+    // Filter unexplored regions
+    bool filter_unexplored_; // Whether to filter wind data in unexplored regions
 
     // Variables
     bool module_init;
     boost::mutex mutex_anemometer;
-    boost::mutex mutex_position;
     double reading_speed;     // m/s
     double reading_direction; // rad
-    bool new_data_position;
-    float curr_x;
-    float curr_y;
     bool verbose;
 
 protected:
@@ -113,15 +105,3 @@ protected:
     void mapCallback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);
     void initialize();
 };
-
-//-------------------------------------------------------
-//	Variables
-//-------------------------------------------------------
-
-/*
-#include <fstream>
-#include <iostream>
-#include <sstream>
-#include <string>
-#include <math.h>
-*/

@@ -1,20 +1,20 @@
 #include "gmrf_map.h"
 #include "Utils.h"
+#include <limits>
 
 /*---------------------------------------------------------------
                         Constructor
   ---------------------------------------------------------------*/
-CGMRF_map::CGMRF_map(rclcpp::Node* _node, const nav_msgs::msg::OccupancyGrid& oc_map, float cell_size, double m_lambdaPrior_reg,
+CGMRF_map::CGMRF_map(rclcpp::Node *_node, const nav_msgs::msg::OccupancyGrid &oc_map, float cell_size, double m_lambdaPrior_reg,
                      double m_lambdaPrior_mass_conservation, double m_lambdaPrior_obstacles, std::string m_colormap, int max_points_cell,
-                     bool verbose)
+                     bool verbose, bool filter_unexplored)
+    : node(_node), verbose(verbose), filter_unexplored_(filter_unexplored)
 {
-    node = _node;
-    this->verbose = verbose;
     try
     {
         // Copy params to internal variables
-        m_Ocgridmap = oc_map;     // Occupancy gridMap from MapServer
-        m_resolution = cell_size; // Desired resolution to build the GMRF (m)
+        m_Ocgridmap = oc_map;
+        m_resolution = cell_size;
         lambdaPrior_reg = m_lambdaPrior_reg;
         lambdaPrior_mass_conservation = m_lambdaPrior_mass_conservation;
         lambdaPrior_obstacles = m_lambdaPrior_obstacles;
@@ -25,523 +25,67 @@ CGMRF_map::CGMRF_map(rclcpp::Node* _node, const nav_msgs::msg::OccupancyGrid& oc
         double y_min = oc_map.info.origin.position.y;
         double y_max = oc_map.info.origin.position.y + oc_map.info.height * oc_map.info.resolution;
 
-        // Adjust size to complaint with the desired resolution (m_resolution):
+        // Adjust size to comply with the desired resolution
         m_x_min = m_resolution * round(x_min / m_resolution);
         m_y_min = m_resolution * round(y_min / m_resolution);
         m_x_max = m_resolution * round(x_max / m_resolution);
         m_y_max = m_resolution * round(y_max / m_resolution);
 
-        // Now the number of cells should be integers:
         m_size_x = round((m_x_max - m_x_min) / m_resolution);
         m_size_y = round((m_y_max - m_y_min) / m_resolution);
         N = m_size_x * m_size_y;
 
-        // For visualization only - pot lines between connected nodes
-        line_list.header.stamp = node->now();
-        line_list.ns = "factors_reg";
-        line_list.type = visualization_msgs::msg::Marker::LINE_LIST;
-        line_list.action = visualization_msgs::msg::Marker::ADD;
-        line_list.id = 0;
-        line_list.points.clear();
-        // color = blue
-        line_list.scale.x = 0.02;
-        line_list.color.r = 0.0;
-        line_list.color.g = 0.0;
-        line_list.color.b = 1.0;
-        line_list.color.a = 1.0;
+        // Initialize visualization markers
+        initializeVisualizationMarkers();
 
-        // For visualization only - plot lines at nodes with Wx==0 or Wy==0 (factors due to obstacles)
-        line_list_obs.header.stamp = node->now();
-        line_list_obs.ns = "factors_obs";
-        line_list_obs.type = visualization_msgs::msg::Marker::LINE_LIST;
-        line_list_obs.action = visualization_msgs::msg::Marker::ADD;
-        line_list_obs.id = 1;
-        line_list_obs.points.clear();
-        // color = blue
-        line_list_obs.scale.x = 0.02;
-        line_list_obs.color.r = 1.0;
-        line_list_obs.color.g = 0.0;
-        line_list_obs.color.b = 0.0;
-        line_list_obs.color.a = 1.0;
+        RCLCPP_INFO(node->get_logger(), "[CGMRF] Generating GMRF for WIND estimation");
 
-        // points to add
-        geometry_msgs::msg::Point p;
-        p.x = 0;
-        p.y = 0;
-        p.z = 0;
-
-        //-------------------------------------------------------
-        // INIT RANDOM FIELD AND CREATE CONNEXIONS BETWEEN NODES
-        //-------------------------------------------------------
-        RCLCPP_INFO(node->get_logger(), "[CGMRF] Generating GMRF for WIND estimation' ");
-
-        // 1. Init the map container
-        //-------------------------
-        TRandomFieldCell init_cell;
-        init_cell.mean = 0.0;
-        init_cell.std = 0.0;
-        m_map.assign(2 * N, init_cell); // Since we have Wx and Wy, we refer to them as: Wx in the range [0,N-1], Wy in the range [N,2N-1]
+        // Initialize the map container (Wx: [0,N-1], Wy: [N,2N-1])
+        TRandomFieldCell init_cell{0.0, 0.0};
+        m_map.assign(2 * N, init_cell);
 
         if (verbose)
         {
-            RCLCPP_INFO(node->get_logger(), "--------------------------------");
-            RCLCPP_INFO(node->get_logger(), "[CGMRF] GMRF created:");
-            RCLCPP_INFO(node->get_logger(), "Occupancy size: x=(%.2f,%.2f)[m] y=(%.2f,%.2f)[m]", x_min, x_max, y_min, y_max);
-            RCLCPP_INFO(node->get_logger(), "Occupancy size: (%u,%u) cells with cell_size %.2fm", oc_map.info.width, oc_map.info.height,
-                        oc_map.info.resolution);
-            RCLCPP_INFO(node->get_logger(), "GMRF size:      x=(%.2f,%.2f)[m] y=(%.2f,%.2f)[m]", m_x_min, m_x_max, m_y_min, m_y_max);
-            RCLCPP_INFO(node->get_logger(), "GMRF size:      (%lu,%lu) cells with cell_size %.2fm", m_size_x, m_size_y, m_resolution);
-            RCLCPP_INFO(node->get_logger(), "GMRF size:      N = %lu cells, 2N = %lu nodes", N, m_map.size());
-            RCLCPP_INFO(node->get_logger(), "--------------------------------");
+            RCLCPP_INFO(node->get_logger(), "[CGMRF] GMRF created: (%lu,%lu) cells, resolution %.2fm, N=%lu nodes",
+                        m_size_x, m_size_y, m_resolution, 2 * N);
         }
 
-        // 2. Set NumFactors
-        //-------------------------
-        //  Determine number of "static" connections=factors between the nodes in the GMRF
-        //  We use the occupancy_map to that end, with the intention to allocate memory in the sparse matrices(speed)
-        nPriorFactors = 2 * ((m_size_x - 1) * m_size_y + m_size_x * (m_size_y - 1)); // Approximation: L = (Nr-1)*Nc + Nr*(Nc-1); Full connected
-
-        /* Proper way....but slower?
-        //2.1 Num prior factors (L)
-        nPriorFactors = 0;
-        for (size_t j=0; j<N; j++)
-        {
-            //Get (r,c) %(row, col)
-            jc = mod(j,Nc);
-            if (jc == 0)
-                jc=Nc;
-            jr = ceil(j/Nc);
-
-
-            // Factor with the right node
-            //-----------------------------
-            if (jc<Nc)
-            {
-                // if Cj and Cj+1 are free
-                if( metricmap(j)==0 && metricmap(j+1)==0 )
-                {
-                    if (factor_regularization)
-                        nPriorFactors = nPriorFactors +2;   //for Wx and Wy
-                }
-                // if Cj or Cj+1 are occupied --> Factor of Null perpendicular value
-                else if( metricmap(j)==0 || metricmap(j+1)==0 )
-                {
-                    if (factor_tangencial_to_obstacles)
-                        nPriorFactors = nPriorFactors +1;
-                // if both are occupied --> No factor
-                }
-            }
-
-
-            // Factor with the above node
-            //---------------------------
-            if (jr<Nr)
-                // if Cj and Cj+Nc are free
-                if( metricmap(j)==0 && metricmap(j+Nc)==0 )
-                     if factor_regularization
-                        nPriorFactors = nPriorFactors +2;   //for Wx and Wy
-                    end;
-
-                // if Cj or Cj+Nc are occupied --> Factor of Null perpendicular value
-                elseif( metricmap(j)==0 || metricmap(j+Nc)==0 )
-                    if factor_tangencial_to_obstacles
-                        nPriorFactors = nPriorFactors +1;
-                    end;
-
-                // if both are occupied --> No factor
-                end;
-            end;
-
-
-            if (factor_mass_conservation_law)
-                // Only set the factor if cell "j" is free, and it is not in the contour of the map
-                if (metricmap(j)==0 && jc>1 && jc<Nc && jr>1 && jr<Nr)
-                    %As soon as any of its neighbour cells is free, set the factor
-                    if (metricmap(j-1)==0)
-                        nPriorFactors = nPriorFactors + 1;
-                    elseif (metricmap(j+1)==0)
-                        nPriorFactors = nPriorFactors + 1;
-                    elseif (metricmap(j-Nc)==0 )
-                        nPriorFactors = nPriorFactors + 1;
-                    elseif (metricmap(j+Nc)==0)
-                        nPriorFactors = nPriorFactors + 1;
-                    end;
-                end;
-            end;
-        }
-        */
-
-        // 2.2 Num Observation factors (M)
+        // Initialize observation tracking
         nObsFactors = 0;
-
-        // 2.3 TOTAL Number of Factors
-        nFactors = nPriorFactors + nObsFactors;
-        if (verbose)
-            RCLCPP_INFO(node->get_logger(), "[CGMRF] Setting up Prior-factors");
-
-        // 3. Reserve memory to SpeedUp
-        //-----------------------------
-        J.clear();
-        J.reserve(5 * nFactors); // Each factor accounts for the connectivity of multiple nodes -->multiple entries
-        Lambda.clear();
-        Lambda.reserve(nFactors); // Diagonal -> 1 entry for each factor
-
-        //------------------------------------
-        // 4. Build Prior Factors (just once)
-        //-------------------------------------
-        // Given the possibility of using different cell_sizes for the GMRF and Occupancy maps,
-        // We need to employ the Occupancy map to determine the real interconnections between cells and therefore create the factors between nodes in
-        // the GMRF.
-
-        size_t count = 0;
-        for (size_t j = 0; j < N; j++) // For each cell in the GMRF
-        {
-            // Get cell_x and cell_y in the GMRF representation
-            size_t jx, jy;
-            id2cellxy(j, jx, jy);
-
-            if (!is_cell_free(j))
-            {
-                // Force occupied cell j to 0 value
-                // This is mandatory for the correct solution of the system
-                Eigen::Triplet<double> lambda_entry(count, count, lambdaPrior_obstacles);
-                Eigen::Triplet<double> J_entry(count, j, 1);
-                Lambda.push_back(lambda_entry);
-                J.push_back(J_entry);
-                count++;
-                Eigen::Triplet<double> lambda_entry2(count, count, lambdaPrior_obstacles);
-                Eigen::Triplet<double> J_entry2(count, j + N, 1);
-                Lambda.push_back(lambda_entry2);
-                J.push_back(J_entry2);
-                count++;
-            }
-
-            // Factor with the right node: (j <--> j+1)
-            //-----------------------------------------
-            if (jx < (m_size_x - 1))
-            {
-                if (is_cell_free(j) && is_cell_free(size_t(j + 1)))
-                {
-                    if (check_connectivity_between2cells(j, size_t(j + 1)))
-                    {
-                        // Create a regularization factor to link both nodes
-                        //  Wx range [1,N]
-                        Eigen::Triplet<double> lambda_entry(count, count, lambdaPrior_reg);
-                        Eigen::Triplet<double> J_entry1(count, j, 1);
-                        Eigen::Triplet<double> J_entry2(count, size_t(j + 1), -1);
-                        Lambda.push_back(lambda_entry);
-                        J.push_back(J_entry1);
-                        J.push_back(J_entry2);
-                        count++;
-
-                        // Wy range [N+1,2N]
-                        Eigen::Triplet<double> lambda_entry2(count, count, lambdaPrior_reg);
-                        Eigen::Triplet<double> J_entry3(count, j + N, 1);
-                        Eigen::Triplet<double> J_entry4(count, size_t(j + N + 1), -1);
-                        Lambda.push_back(lambda_entry2);
-                        J.push_back(J_entry3);
-                        J.push_back(J_entry4);
-                        count++;
-
-                        // plot marker between cell j and j+1
-                        id2xy(j, p.x, p.y);
-                        p.z = 0;
-                        line_list.points.push_back(p);
-                        id2xy(j + 1, p.x, p.y);
-                        line_list.points.push_back(p);
-                    }
-                    else
-                    {
-                        // An obstacle is in between both cells
-                        // 1. Do not create a regularization link
-                        // 2. Force Wx=0 at both cells
-                        Eigen::Triplet<double> lambda_entry(count, count, lambdaPrior_obstacles);
-                        Eigen::Triplet<double> J_entry(count, j, 1);
-                        Lambda.push_back(lambda_entry);
-                        J.push_back(J_entry);
-                        count++;
-                        // Plot marker to display Wx=0
-                        id2xy(j, p.x, p.y);
-                        p.z = 0;
-                        p.x += m_resolution / 5;
-                        p.y += m_resolution / 5;
-                        line_list_obs.points.push_back(p);
-                        p.y -= 2 * m_resolution / 5;
-                        line_list_obs.points.push_back(p);
-
-                        Eigen::Triplet<double> lambda_entry2(count, count, lambdaPrior_obstacles);
-                        Eigen::Triplet<double> J_entry2(count, j + 1, 1);
-                        Lambda.push_back(lambda_entry2);
-                        J.push_back(J_entry2);
-                        count++;
-                        // Plot marker to display Wx=0
-                        id2xy(j + 1, p.x, p.y);
-                        p.z = 0;
-                        p.x -= m_resolution / 5;
-                        p.y += m_resolution / 5;
-                        line_list_obs.points.push_back(p);
-                        p.y -= 2 * m_resolution / 5;
-                        line_list_obs.points.push_back(p);
-                    }
-                }
-                else if (is_cell_free(j))
-                {
-                    // Force Wx=0 at j
-                    Eigen::Triplet<double> lambda_entry(count, count, lambdaPrior_obstacles);
-                    Eigen::Triplet<double> J_entry(count, j, 1);
-                    Lambda.push_back(lambda_entry);
-                    J.push_back(J_entry);
-                    count++;
-                    // Plot marker to display Wx=0
-                    id2xy(j, p.x, p.y);
-                    p.z = 0;
-                    p.x += m_resolution / 5;
-                    p.y += m_resolution / 5;
-                    line_list_obs.points.push_back(p);
-                    p.y -= 2 * m_resolution / 5;
-                    line_list_obs.points.push_back(p);
-                }
-                else if (is_cell_free(j + 1))
-                {
-                    // Force Wx=0 at j+1
-                    Eigen::Triplet<double> lambda_entry(count, count, lambdaPrior_obstacles);
-                    Eigen::Triplet<double> J_entry(count, j + 1, 1);
-                    Lambda.push_back(lambda_entry);
-                    J.push_back(J_entry);
-                    count++;
-                    // Plot marker to display Wx=0
-                    id2xy(j + 1, p.x, p.y);
-                    p.z = 0;
-                    p.x -= m_resolution / 5;
-                    p.y += m_resolution / 5;
-                    line_list_obs.points.push_back(p);
-                    p.y -= 2 * m_resolution / 5;
-                    line_list_obs.points.push_back(p);
-                }
-                // else --> Both cells occupied -> Do nothing!
-            }
-
-            // Factor with the upper node: (j <--> j+m_size_x)
-            //------------------------------------------------
-            if (jy < (m_size_y - 1))
-            {
-                if (is_cell_free(j) && is_cell_free(j + m_size_x))
-                {
-                    if (check_connectivity_between2cells(j, j + m_size_x))
-                    {
-                        // Create a regularization factor to link both nodes
-                        //  Wx range [1,N]
-                        Eigen::Triplet<double> lambda_entry(count, count, lambdaPrior_reg);
-                        Eigen::Triplet<double> J_entry1(count, j, 1);
-                        Eigen::Triplet<double> J_entry2(count, j + m_size_x, -1);
-                        Lambda.push_back(lambda_entry);
-                        J.push_back(J_entry1);
-                        J.push_back(J_entry2);
-                        count++;
-
-                        // Wy range [N+1,2N]
-                        Eigen::Triplet<double> lambda_entry2(count, count, lambdaPrior_reg);
-                        Eigen::Triplet<double> J_entry3(count, j + N, 1);
-                        Eigen::Triplet<double> J_entry4(count, j + N + m_size_x, -1);
-                        Lambda.push_back(lambda_entry2);
-                        J.push_back(J_entry3);
-                        J.push_back(J_entry4);
-                        count++;
-
-                        // plot marker between cell j and j+m_size_x
-                        id2xy(j, p.x, p.y);
-                        p.z = 0;
-                        line_list.points.push_back(p);
-                        id2xy(j + m_size_x, p.x, p.y);
-                        line_list.points.push_back(p);
-                    }
-                    else
-                    {
-                        // An obstacle is in between both cells
-                        // 1. Do not create a regularization link
-                        // 2. Force Wy=0 at both cells
-                        // Force Wy=0
-                        Eigen::Triplet<double> lambda_entry(count, count, lambdaPrior_obstacles);
-                        Eigen::Triplet<double> J_entry(count, j + N, 1);
-                        Lambda.push_back(lambda_entry);
-                        J.push_back(J_entry);
-                        count++;
-                        // Plot marker to display Wy=0
-                        id2xy(j, p.x, p.y);
-                        p.z = 0;
-                        p.y += m_resolution / 5;
-                        p.x -= m_resolution / 5;
-                        line_list_obs.points.push_back(p);
-                        p.x += 2 * m_resolution / 5;
-                        line_list_obs.points.push_back(p);
-
-                        // Force Wy=0
-                        Eigen::Triplet<double> lambda_entry2(count, count, lambdaPrior_obstacles);
-                        Eigen::Triplet<double> J_entry2(count, j + N + m_size_x, 1);
-                        Lambda.push_back(lambda_entry2);
-                        J.push_back(J_entry2);
-                        count++;
-                        // Plot marker to display Wy=0
-                        id2xy(j + m_size_x, p.x, p.y);
-                        p.z = 0;
-                        p.y -= m_resolution / 5;
-                        p.x -= m_resolution / 5;
-                        line_list_obs.points.push_back(p);
-                        p.x += 2 * m_resolution / 5;
-                        line_list_obs.points.push_back(p);
-                    }
-                }
-                else if (is_cell_free(j))
-                {
-                    // Force Wy=0 at j
-                    Eigen::Triplet<double> lambda_entry(count, count, lambdaPrior_obstacles);
-                    Eigen::Triplet<double> J_entry(count, j + N, 1);
-                    Lambda.push_back(lambda_entry);
-                    J.push_back(J_entry);
-                    count++;
-                    // Plot marker to display Wy=0
-                    id2xy(j, p.x, p.y);
-                    p.z = 0;
-                    p.y += m_resolution / 5;
-                    p.x -= m_resolution / 5;
-                    line_list_obs.points.push_back(p);
-                    p.x += 2 * m_resolution / 5;
-                    line_list_obs.points.push_back(p);
-                }
-                else if (is_cell_free(j + m_size_x))
-                {
-                    // Force Wy=0 at j+m_size_x
-                    Eigen::Triplet<double> lambda_entry2(count, count, lambdaPrior_obstacles);
-                    Eigen::Triplet<double> J_entry2(count, j + N + m_size_x, 1);
-                    Lambda.push_back(lambda_entry2);
-                    J.push_back(J_entry2);
-                    count++;
-                    // Plot marker to display Wy=0
-                    id2xy(j + m_size_x, p.x, p.y);
-                    p.z = 0;
-                    p.y -= m_resolution / 5;
-                    p.x -= m_resolution / 5;
-                    line_list_obs.points.push_back(p);
-                    p.x += 2 * m_resolution / 5;
-                    line_list_obs.points.push_back(p);
-                }
-                // else --> Both cells occupied -> Do nothing!
-            }
-
-            // Factors for mass conservative Law (avoid borders of map)
-            //---------------------------------------------------------
-
-            if (is_cell_free(j) && jx > 0 && jx < m_size_x - 1 && jy > 0 && jy < m_size_y - 1)
-            {
-                // As soon as any of its 8 clossest neighbour cells is free, set the factor
-                bool set = false;
-                if (is_cell_free(j - 1))
-                {
-                    Eigen::Triplet<double> J_entry(count, j - 1, -1);
-                    J.push_back(J_entry);
-                    set = true;
-                }
-                if (is_cell_free(j + 1))
-                {
-                    Eigen::Triplet<double> J_entry(count, j + 1, 1);
-                    J.push_back(J_entry);
-                    set = true;
-                }
-                if (is_cell_free(j - m_size_x))
-                {
-                    Eigen::Triplet<double> J_entry(count, j + N - m_size_x, -1);
-                    J.push_back(J_entry);
-                    set = true;
-                }
-                if (is_cell_free(j + m_size_x))
-                {
-                    Eigen::Triplet<double> J_entry(count, j + N + m_size_x, 1);
-                    J.push_back(J_entry);
-                    set = true;
-                }
-
-                // Diagonals
-                if (is_cell_free(j + m_size_x - 1))
-                {
-                    Eigen::Triplet<double> J_entry(count, j + m_size_x - 1, -0.5);
-                    Eigen::Triplet<double> J_entry2(count, j + m_size_x - 1 + N, 0.5);
-                    J.push_back(J_entry);
-                    J.push_back(J_entry2);
-                    set = true;
-                }
-                if (is_cell_free(j + m_size_x + 1))
-                {
-                    Eigen::Triplet<double> J_entry(count, j + m_size_x + 1, 0.5);
-                    Eigen::Triplet<double> J_entry2(count, j + m_size_x + 1 + N, 0.5);
-                    J.push_back(J_entry);
-                    J.push_back(J_entry2);
-                    set = true;
-                }
-                if (is_cell_free(j - m_size_x + 1))
-                {
-                    Eigen::Triplet<double> J_entry(count, j - m_size_x + 1, 0.5);
-                    Eigen::Triplet<double> J_entry2(count, j - m_size_x + 1 + N, -0.5);
-                    J.push_back(J_entry);
-                    J.push_back(J_entry2);
-                    set = true;
-                }
-                if (is_cell_free(j - m_size_x - 1))
-                {
-                    Eigen::Triplet<double> J_entry(count, j - m_size_x - 1, -0.5);
-                    Eigen::Triplet<double> J_entry2(count, j - m_size_x - 1 + N, -0.5);
-                    J.push_back(J_entry);
-                    J.push_back(J_entry2);
-                    set = true;
-                }
-
-                // If factor is to be set...
-                if (set)
-                {
-                    Eigen::Triplet<double> lambda_entry(count, count, lambdaPrior_mass_conservation);
-                    Lambda.push_back(lambda_entry);
-                    count++;
-                    set = false;
-                }
-            }
-
-        } // end for setting factors
-
-        // Set number of Factors
-        nPriorFactors = count;
-        nFactors = nPriorFactors + nObsFactors;
         activeObs.clear();
-        RCLCPP_INFO(node->get_logger(), "[CGMRF] Initialization complete: %lu factors for a map size of 2N=%lu nodes", nFactors, m_map.size());
 
-        // Set the colormap to display the wind vectors
+        // Build prior factors with visualization markers
+        buildPriorFactors(true);
+
         init_colormaps("jet");
-
-        // DEBUG: Save to file
-        //-------------------
-        /*
-        Eigen::VectorXd y_empty;
-        y_empty.resize(nFactors);
-        y_empty.fill(0.0);
-        save_grmf_factor_graph(J,Lambda,y_empty);
-        */
-
-        // DEGUB : ADD FIXED OBSERVATION
-        /*
-        TobservationGMRF new_obs;
-        const int cellIdx = xy2idx( 3.0, 3.0 );
-        new_obs.cell_idx = cellIdx;
-        new_obs.windX = 0.10;
-        new_obs.windY = 1.0;
-        new_obs.lambda = 13;
-        new_obs.time_invariant = false;		//Default behaviour, the obs will lose weight with time.
-        RCLCPP_INFO(node->get_logger(), "[GMRF] DEMO obs: Wx = %.2f m/s Wy = %.2f m/s at cell %lu\n\n", new_obs.windX,new_obs.windY,new_obs.cell_idx);
-        activeObs.push_back(new_obs);
-        nObsFactors += 2;    //we add 2 factors for each observation to account for Wx and Wy components
-        */
+        RCLCPP_INFO(node->get_logger(), "[CGMRF] Initialization complete: %lu factors for %lu nodes", nFactors, 2 * N);
     }
-    catch (std::exception e)
+    catch (const std::exception &e)
     {
-        RCLCPP_ERROR(node->get_logger(), "[GMRF-Constructor] Exception: %s ", e.what());
+        RCLCPP_ERROR(node->get_logger(), "[GMRF-Constructor] Exception: %s", e.what());
     }
+}
+
+void CGMRF_map::initializeVisualizationMarkers()
+{
+    auto setupMarker = [this](visualization_msgs::msg::Marker &marker, const std::string &ns, int id,
+                              float r, float g, float b)
+    {
+        marker.header.stamp = node->now();
+        marker.ns = ns;
+        marker.type = visualization_msgs::msg::Marker::LINE_LIST;
+        marker.action = visualization_msgs::msg::Marker::ADD;
+        marker.id = id;
+        marker.points.clear();
+        marker.scale.x = 0.02;
+        marker.color.r = r;
+        marker.color.g = g;
+        marker.color.b = b;
+        marker.color.a = 1.0;
+    };
+
+    setupMarker(line_list, "factors_reg", 0, 0.0, 0.0, 1.0);     // Blue for regularization
+    setupMarker(line_list_obs, "factors_obs", 1, 1.0, 0.0, 0.0); // Red for obstacles
 }
 
 /*---------------------------------------------------------------
@@ -555,7 +99,7 @@ CGMRF_map::~CGMRF_map()
                 Dynamic Map Update Methods
   ---------------------------------------------------------------*/
 
-bool CGMRF_map::hasMapChanged(const nav_msgs::msg::OccupancyGrid& new_map) const
+bool CGMRF_map::hasMapChanged(const nav_msgs::msg::OccupancyGrid &new_map) const
 {
     // Calculate new map bounds
     double new_x_min = new_map.info.origin.position.x;
@@ -584,7 +128,7 @@ std::vector<SavedObservation> CGMRF_map::getActiveObservations() const
     std::vector<SavedObservation> saved;
     saved.reserve(activeObs.size());
 
-    for (const auto& obs : activeObs)
+    for (const auto &obs : activeObs)
     {
         SavedObservation s;
         // Convert cell index back to world coordinates
@@ -603,9 +147,9 @@ std::vector<SavedObservation> CGMRF_map::getActiveObservations() const
     return saved;
 }
 
-void CGMRF_map::restoreObservations(const std::vector<SavedObservation>& observations)
+void CGMRF_map::restoreObservations(const std::vector<SavedObservation> &observations)
 {
-    for (const auto& obs : observations)
+    for (const auto &obs : observations)
     {
         // Check if the observation is within the new map bounds
         if (obs.x_pos >= m_x_min && obs.x_pos < m_x_max &&
@@ -702,7 +246,7 @@ bool CGMRF_map::expandGrid(float new_x_min, float new_x_max, float new_y_min, fl
         activeObs.clear();
         nObsFactors = 0;
 
-        for (const auto& obs : old_obs)
+        for (const auto &obs : old_obs)
         {
             int new_idx = mapOldIdxToNewIdx(obs.cell_idx, old_size_x, old_x_min, old_y_min);
             if (new_idx >= 0 && static_cast<size_t>(new_idx) < N)
@@ -719,14 +263,14 @@ bool CGMRF_map::expandGrid(float new_x_min, float new_x_max, float new_y_min, fl
 
         return true;
     }
-    catch (std::exception& e)
+    catch (std::exception &e)
     {
         RCLCPP_ERROR(node->get_logger(), "[GMRF] Exception during grid expansion: %s", e.what());
         return false;
     }
 }
 
-bool CGMRF_map::updateOccupancyMap(const nav_msgs::msg::OccupancyGrid& new_map)
+bool CGMRF_map::updateOccupancyMap(const nav_msgs::msg::OccupancyGrid &new_map)
 {
     try
     {
@@ -772,20 +316,23 @@ bool CGMRF_map::updateOccupancyMap(const nav_msgs::msg::OccupancyGrid& new_map)
 
         return true;
     }
-    catch (std::exception& e)
+    catch (std::exception &e)
     {
         RCLCPP_ERROR(node->get_logger(), "[GMRF] Exception updating occupancy map: %s", e.what());
         return false;
     }
 }
 
-void CGMRF_map::buildPriorFactors()
+void CGMRF_map::buildPriorFactors(bool include_visualization)
 {
     // Clear existing prior factors
     J.clear();
     Lambda.clear();
-    line_list.points.clear();
-    line_list_obs.points.clear();
+    if (include_visualization)
+    {
+        line_list.points.clear();
+        line_list_obs.points.clear();
+    }
 
     // Estimate number of factors for memory reservation
     nPriorFactors = 2 * ((m_size_x - 1) * m_size_y + m_size_x * (m_size_y - 1));
@@ -841,10 +388,13 @@ void CGMRF_map::buildPriorFactors()
                     J.push_back(J_entry4);
                     count++;
 
-                    id2xy(j, p.x, p.y);
-                    line_list.points.push_back(p);
-                    id2xy(j + 1, p.x, p.y);
-                    line_list.points.push_back(p);
+                    if (include_visualization)
+                    {
+                        id2xy(j, p.x, p.y);
+                        line_list.points.push_back(p);
+                        id2xy(j + 1, p.x, p.y);
+                        line_list.points.push_back(p);
+                    }
                 }
                 else
                 {
@@ -905,10 +455,13 @@ void CGMRF_map::buildPriorFactors()
                     J.push_back(J_entry4);
                     count++;
 
-                    id2xy(j, p.x, p.y);
-                    line_list.points.push_back(p);
-                    id2xy(j + m_size_x, p.x, p.y);
-                    line_list.points.push_back(p);
+                    if (include_visualization)
+                    {
+                        id2xy(j, p.x, p.y);
+                        line_list.points.push_back(p);
+                        id2xy(j + m_size_x, p.x, p.y);
+                        line_list.points.push_back(p);
+                    }
                 }
                 else
                 {
@@ -1014,14 +567,14 @@ void CGMRF_map::buildPriorFactors()
                         Cell index transformations
   ---------------------------------------------------------------*/
 // Get x,y in cells (in the GMRF representation) from the general index in the array
-void CGMRF_map::id2cellxy(size_t id, size_t& cell_x, size_t& cell_y)
+void CGMRF_map::id2cellxy(size_t id, size_t &cell_x, size_t &cell_y)
 {
     cell_x = id % m_size_x;
     cell_y = (size_t)floor(id / m_size_x);
 }
 
 // Get pose x,y (in meters) (in the GMRF representation) from the general index in the array
-void CGMRF_map::id2xy(size_t id, double& x, double& y)
+void CGMRF_map::id2xy(size_t id, double &x, double &y)
 {
     size_t cell_x, cell_y;
     id2cellxy(id, cell_x, cell_y);
@@ -1046,30 +599,52 @@ bool CGMRF_map::is_cell_free(size_t id_gmrf)
     id_oc = static_cast<int>((cell_1_x - m_Ocgridmap.info.origin.position.x) / m_Ocgridmap.info.resolution);                           // x component
     id_oc += static_cast<int>((cell_1_y - m_Ocgridmap.info.origin.position.y) / m_Ocgridmap.info.resolution) * m_Ocgridmap.info.width; // y component
 
-    /* DEBUG
-    double cellx,celly;
-    cellx = m_Ocgridmap.info.origin.position.x + (id_oc % m_Ocgridmap.info.width)*m_Ocgridmap.info.resolution + m_Ocgridmap.info.resolution/2;
-    celly = m_Ocgridmap.info.origin.position.y + ((size_t) floor(id_oc/m_Ocgridmap.info.width))*m_Ocgridmap.info.resolution +
-    m_Ocgridmap.info.resolution/2;
-    */
+    try
+    {
+        return m_Ocgridmap.data[id_oc] < 50.0;
+    }
+    catch (const std::exception &e)
+    {
+        RCLCPP_ERROR(node->get_logger(), "[GMRF] Exception checking cell freedom: %s", e.what());
+        return false;
+    }
+}
+
+/*---------------------------------------------------------------
+             Check if a cell is explored (not unknown)
+  ---------------------------------------------------------------*/
+// Check at OccupancyMap level, if a cell has been explored (not unknown/unobserved)
+// Unknown cells typically have value -1 in OccupancyGrid
+bool CGMRF_map::is_cell_explored(size_t id_gmrf)
+{
+    // The pose x,y (meters) of cell center
+    double cell_1_x, cell_1_y;
+    id2xy(id_gmrf, cell_1_x, cell_1_y);
+
+    // Get corresponding cell_idx in the Occupancy Gridmap
+    int id_oc;
+    id_oc = static_cast<int>((cell_1_x - m_Ocgridmap.info.origin.position.x) / m_Ocgridmap.info.resolution);
+    id_oc += static_cast<int>((cell_1_y - m_Ocgridmap.info.origin.position.y) / m_Ocgridmap.info.resolution) * m_Ocgridmap.info.width;
 
     try
     {
-        // Check occupancy
-        if (m_Ocgridmap.data[id_oc] >= 50.0)
+        // Check if index is valid
+        if (id_oc < 0 || static_cast<size_t>(id_oc) >= m_Ocgridmap.data.size())
         {
-            // RCLCPP_INFO(node->get_logger(), "[GMRF] OCCUPIED %lu = (%.2f,%.2f) --> %lu in Occ",idx_1_gmrf,cell_1_x,cell_1_y, idx_1_oc);
-            return false;
+            return false; // Out of bounds = unexplored
         }
-        else
+
+        // Check if cell is unknown (-1 indicates unexplored in OccupancyGrid)
+        // Some implementations use values < 0 for unknown
+        if (m_Ocgridmap.data[id_oc] < 0)
         {
-            // RCLCPP_INFO(node->get_logger(), "[GMRF] FREE %lu = (%.2f,%.2f) --> %lu in Occ",idx_1_gmrf,cell_1_x,cell_1_y, idx_1_oc);
-            return true;
+            return false; // Unexplored
         }
+        return true;
     }
-    catch (std::exception e)
+    catch (const std::exception &e)
     {
-        RCLCPP_ERROR(node->get_logger(), "[GMRF] Exception while checking cell freedom: %s ", e.what());
+        RCLCPP_ERROR(node->get_logger(), "[GMRF] Exception checking cell exploration: %s", e.what());
         return false;
     }
 }
@@ -1130,9 +705,9 @@ bool CGMRF_map::check_connectivity_between2cells(size_t idx_1_gmrf, size_t idx_2
 
         return connected;
     }
-    catch (std::exception e)
+    catch (const std::exception &e)
     {
-        RCLCPP_ERROR(node->get_logger(), "[GMRF] Exception while checking cells interconnections: %s ", e.what());
+        RCLCPP_ERROR(node->get_logger(), "[GMRF] Exception checking cell connectivity: %s", e.what());
         return false;
     }
 }
@@ -1144,9 +719,9 @@ void CGMRF_map::insertObservation_GMRF(double wind_speed, double wind_direction,
 {
     try
     {
-        auto add_obs = [this](const TobservationGMRF& observation)
+        auto add_obs = [this](const TobservationGMRF &observation)
         {
-            if(observation.cell_idx <0 || observation.cell_idx > N)
+            if (observation.cell_idx < 0 || observation.cell_idx > N)
             {
                 RCLCPP_ERROR(node->get_logger(), "Observation is outside of the map!");
                 return;
@@ -1158,6 +733,14 @@ void CGMRF_map::insertObservation_GMRF(double wind_speed, double wind_direction,
         // The wind vector provided is already the DownWind direction in the map reference system
         if (x_pos <= m_x_min || x_pos >= m_x_max || y_pos <= m_y_min || y_pos >= m_y_max || !is_cell_free(cellIdx))
             return;
+
+        // Filter observations in unexplored regions if filtering is enabled
+        if (filter_unexplored_ && !is_cell_explored(cellIdx))
+        {
+            if (verbose)
+                RCLCPP_DEBUG(node->get_logger(), "[GMRF] Rejecting observation at unexplored cell (%.2f, %.2f)", x_pos, y_pos);
+            return;
+        }
 
         TobservationGMRF new_obs;
         new_obs.cell_idx = cellIdx;
@@ -1173,28 +756,38 @@ void CGMRF_map::insertObservation_GMRF(double wind_speed, double wind_direction,
         nObsFactors += 2; // we add 2 factors foe each observation to account for Wx and Wy components
 
         // NOTE --> We create 4 observations to expand a bit the measurement impact, replicating the content to neighbour cells
-        if (is_cell_free(cellIdx - 1))
+        // Also check that neighbor cells are explored when filtering is enabled
+        auto is_valid_neighbor = [this](int idx)
+        {
+            if (!is_cell_free(idx))
+                return false;
+            if (filter_unexplored_ && !is_cell_explored(idx))
+                return false;
+            return true;
+        };
+
+        if (is_valid_neighbor(cellIdx - 1))
         {
             new_obs.cell_idx = cellIdx - 1;
             add_obs(new_obs);
             nObsFactors += 2;
         }
-        if (is_cell_free(cellIdx - m_size_x))
+        if (is_valid_neighbor(cellIdx - m_size_x))
         {
             new_obs.cell_idx = cellIdx - m_size_x;
             add_obs(new_obs);
             nObsFactors += 2;
         }
-        if (is_cell_free(cellIdx - m_size_x - 1))
+        if (is_valid_neighbor(cellIdx - m_size_x - 1))
         {
             new_obs.cell_idx = cellIdx - m_size_x - 1;
             add_obs(new_obs);
             nObsFactors += 2;
         }
     }
-    catch (std::exception e)
+    catch (const std::exception &e)
     {
-        RCLCPP_ERROR(node->get_logger(), "[GMRF] Exception while Inserting new Observation: %s ", e.what());
+        RCLCPP_ERROR(node->get_logger(), "[GMRF] Exception inserting observation: %s", e.what());
     }
 }
 
@@ -1264,9 +857,6 @@ void CGMRF_map::updateMapEstimation_GMRF(float lambdaObsLoss)
             count++;
         }
 
-        // DEBUG - Save to file
-        // save_grmf_factor_graph(J_temp,Lambda_temp,y_temp);
-
         // 3. Build Matrices (J, J', A, H, G)
         Eigen::SparseMatrix<double> Jsparse(nFactors, 2 * N); // declares a column-major sparse matrix type of float
         Jsparse.setFromTriplets(J_temp.begin(), J_temp.end());
@@ -1292,12 +882,7 @@ void CGMRF_map::updateMapEstimation_GMRF(float lambdaObsLoss)
         if (verbose)
             RCLCPP_INFO(node->get_logger(), "          [GMRF] G is (%lu,%lu)", G.rows(), G.cols());
 
-        // DEBUG - Save to file
-        // save_grmf_factor_graph(Hsparse, G);
-
-        //----------
         // 4. SOLVE
-        //----------
         // We need to solve: H * inc_m = -G
         // In an interative scenario: m = m + inc_m;
         // In our case, we do not need to consider the previous state, so m = inc_m
@@ -1307,27 +892,20 @@ void CGMRF_map::updateMapEstimation_GMRF(float lambdaObsLoss)
         Eigen::VectorXd m_inc = solver.solve(G);
 
         if (verbose)
-            RCLCPP_INFO(node->get_logger(), "[GMRF] system solved with solution size (%lu,%lu)", m_inc.rows(), m_inc.cols());
-        std::ofstream file("/home/jgmonroy/gmrf_solution.txt");
-        if (file.is_open())
-        {
-            file << m_inc;
-        }
-        file.close();
+            RCLCPP_INFO(node->get_logger(), "[GMRF] System solved with solution size (%lu,%lu)", m_inc.rows(), m_inc.cols());
 
         // 5. Update GMRF values from current solution
         for (size_t j = 0; j < m_map.size(); j++)
         {
-            m_map[j].mean = m_inc(j); // Not iterative! no need to increment previous state
-            m_map[j].std = 0.0;       // Not used right now
+            m_map[j].mean = m_inc(j);
+            m_map[j].std = 0.0; // Not used currently
         }
 
-        // 7. Update Information/Strength of Active Observations
-        //-------------------------------------------------------
-        std::vector<TobservationGMRF>::iterator ito = activeObs.begin();
+        // 6. Update Information/Strength of Active Observations
+        auto ito = activeObs.begin();
         while (ito != activeObs.end())
         {
-            if (ito->time_invariant == false)
+            if (!ito->time_invariant)
             {
                 ito->lambda -= lambdaObsLoss;
                 if (ito->lambda <= 0.0)
@@ -1344,14 +922,20 @@ void CGMRF_map::updateMapEstimation_GMRF(float lambdaObsLoss)
         if (verbose)
             RCLCPP_INFO(node->get_logger(), "[GMRF] %lu ObservationFactors are active", nObsFactors);
     }
-    catch (std::exception e)
+    catch (const std::exception &e)
     {
-        RCLCPP_ERROR(node->get_logger(), "[GMRF] Exception Updating the maps: %s ", e.what());
+        RCLCPP_ERROR(node->get_logger(), "[GMRF] Exception updating maps: %s", e.what());
     }
 }
 
 WindVector CGMRF_map::getEstimation(int index)
 {
+    // If filtering is enabled and cell is unexplored, return zero wind
+    if (filter_unexplored_ && !is_cell_explored(index))
+    {
+        return {0.0, 0.0, std::numeric_limits<double>::max()}; // Return invalid/zero wind with max uncertainty
+    }
+
     double module = sqrt(pow(m_map[index].mean, 2) + pow(m_map[index + N].mean, 2));
     double direction = atan2(m_map[index + N].mean, m_map[index].mean);
     double stdev = std::max(0.1, sqrt(pow(m_map[index].std, 2) + pow(m_map[index + N].std, 2)));
@@ -1362,10 +946,17 @@ WindVector CGMRF_map::getEstimation(int index)
 WindVector CGMRF_map::getEstimation(double x, double y)
 {
     int i = xy2idx(x, y);
+
+    // Check bounds before querying
+    if (i < 0 || static_cast<size_t>(i) >= N)
+    {
+        return {0.0, 0.0, std::numeric_limits<double>::max()};
+    }
+
     return getEstimation(i);
 }
 
-void CGMRF_map::get_as_markerArray(visualization_msgs::msg::MarkerArray& ma, std::string frame_id)
+void CGMRF_map::get_as_markerArray(visualization_msgs::msg::MarkerArray &ma, std::string frame_id)
 {
     ma.markers.clear();
     // options (debug)
@@ -1441,15 +1032,24 @@ void CGMRF_map::get_as_markerArray(visualization_msgs::msg::MarkerArray& ma, std
         marker.action = visualization_msgs::msg::Marker::ADD;
 
         // Get max wind vector in the map (to normalize the plot)
+        // Only consider explored cells when filtering is enabled
         double max_module = 0.0;
         for (size_t i = 0; i < N; i++)
         {
+            // Skip unexplored cells when filtering is enabled
+            if (filter_unexplored_ && !is_cell_explored(i))
+                continue;
+
             if (sqrt(pow(m_map[i].mean, 2) + pow(m_map[i + N].mean, 2) > max_module))
                 max_module = sqrt(pow(m_map[i].mean, 2) + pow(m_map[i + N].mean, 2));
         }
 
         for (size_t i = 0; i < N; i++)
         {
+            // Skip unexplored cells when filtering is enabled
+            if (filter_unexplored_ && !is_cell_explored(i))
+                continue;
+
             // if (is_cell_free(i))
             {
                 double module = sqrt(pow(m_map[i].mean, 2) + pow(m_map[i + N].mean, 2));
@@ -1482,7 +1082,7 @@ void CGMRF_map::get_as_markerArray(visualization_msgs::msg::MarkerArray& ma, std
     }
 }
 
-void CGMRF_map::save_grmf_factor_graph(std::vector<Eigen::Triplet<double>>& Jout, std::vector<Eigen::Triplet<double>>& Aout, Eigen::VectorXd& yout)
+void CGMRF_map::save_grmf_factor_graph(std::vector<Eigen::Triplet<double>> &Jout, std::vector<Eigen::Triplet<double>> &Aout, Eigen::VectorXd &yout)
 {
     bool save_dense = true;
     bool save_sparse = true;
@@ -1558,7 +1158,7 @@ void CGMRF_map::save_grmf_factor_graph(std::vector<Eigen::Triplet<double>>& Jout
 }
 
 // Save Sparse matrices to file (for debug)
-void CGMRF_map::save_grmf_factor_graph(Eigen::SparseMatrix<double>& H, Eigen::VectorXd& G)
+void CGMRF_map::save_grmf_factor_graph(Eigen::SparseMatrix<double> &H, Eigen::VectorXd &G)
 {
     // 1. Hessian
     std::ofstream file("/home/jgmonroy/gmrf_hessian.txt");
