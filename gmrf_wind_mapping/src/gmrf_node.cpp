@@ -202,7 +202,7 @@ void Cgmrf::sensorCallback(const olfaction_msgs::msg::Anemometer::SharedPtr msg)
                 // lookuptransform (target_frame, target_time, pose_in, fixed_frame, pose_out)
                 tf_buffer->transform(anemometer_upWind_pose, map_upWind_pose, frame_id.c_str());
 
-                downwind_direction_map = angles::normalize_angle(Utils::getYaw(map_upWind_pose.pose.orientation) + 3.14159);
+                downwind_direction_map = angles::normalize_angle(Utils::getYaw(map_upWind_pose.pose.orientation) + M_PI);
             }
             catch (const tf2::TransformException &ex)
             {
