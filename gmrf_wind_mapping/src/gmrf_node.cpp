@@ -55,7 +55,8 @@ Cgmrf::Cgmrf()
     //----------------------------------
     // Subscriptions
     //----------------------------------
-    sub_sensor = create_subscription<olfaction_msgs::msg::Anemometer>(sensor_topic, 10, std::bind(&Cgmrf::sensorCallback, this, _1));
+    sub_sensor = create_subscription<olfaction_msgs::msg::Anemometer>(
+        sensor_topic, rclcpp::SensorDataQoS(), std::bind(&Cgmrf::sensorCallback, this, _1));
     ocupancyMap_sub = create_subscription<nav_msgs::msg::OccupancyGrid>(
         declare_parameter<std::string>("map_topic", "map"), rclcpp::QoS(1).transient_local().reliable(), std::bind(&Cgmrf::mapCallback, this, _1));
     //----------------------------------
