@@ -1,15 +1,136 @@
 # GMRF-wind
 
-A Gaussian Markov Random Field (GMRF) is a specific type of Markov Random Field (MRF) where the set of random variables follows a multivariate Gaussian (Normal) distribution. It is a statistical model used to describe the dependencies among a collection of random variables, often representing spatial or temporal data. This repository applies this framwork to the estimation of 2D wind maps (W) from a set of wind vector observations (Z) and prior knowledge encapsulating physical constraints, providing a ROS2 wrapped implementation of the algorithm presented in this paper: https://ieeexplore.ieee.org/document/7968883
+Gaussian Markov Random Field (GMRF) based real-time 2D wind field estimation for robotic olfaction systems. Part of the [GSExploration](../documents/knowledge-overview.md) gas source localization system.
 
-The core of the Gaussian Markov Random Field (GMRF) framework is the definition of energy terms (or factors) that encode the relationships between adjacent cells and observations, ultimately leading to the Maximum a Posteriori (MAP) estimation through the minimization of the total energy function, E(W,Z). For GMRF-W (used for Online Estimation of 2D Wind Maps), four primary ”energies”
-are considered. All four terms have direct or conceptual physical relevance. The overall energy function E(W,Z) is the sum of these four factors:
-     E(W,Z) = Ez(W,Z) + Em(W) + Eo(W) + Er(W)
+## Overview
 
-By combining these four energy terms, the GMRF-W framework is able to estimate a 2D wind map that is consistent with observations (Ez), respects the presence of obstacles (Eo), and adheres to the law of mass conservation for incompressible flow (Em). Moreover a reguralization constrain is applied (Er). This allows the GMRF-W approach to function as a real-time 2D approximation of more complex Computational Fluid Dynamics (CFD) techniques, ideal for robotics that adquire new observations as they inspect the environment.
+A Gaussian Markov Random Field (GMRF) is a probabilistic graphical model where random variables follow a multivariate Gaussian distribution with Markov properties (local dependencies). This package applies GMRF to estimate 2D wind vector fields from sparse anemometer observations while respecting physical constraints.
 
-If it is relevant to your research, you can cite the paper with the following BibTex: 
+This is a ROS 2 implementation of the algorithm presented in:
 
+> Monroy, J., Jaimez, M., & Gonzalez-Jimenez, J. (2017). **Online Estimation of 2D Wind Maps for Olfactory Robots**. International Symposium on Olfaction and Electronic Nose (ISOEN). [DOI: 10.1109/ISOEN.2017.7968883](https://ieeexplore.ieee.org/document/7968883)
+
+## Energy Function
+
+The GMRF-W framework estimates wind maps (W) from observations (Z) by minimizing an energy function:
+
+```
+E(W,Z) = Ez(W,Z) + Em(W) + Eo(W) + Er(W)
+```
+
+| Energy Term | Description             | Physical Meaning                         |
+| ----------- | ----------------------- | ---------------------------------------- |
+| **Ez**      | Observation consistency | Wind estimates match sensor measurements |
+| **Em**      | Mass conservation       | Incompressible flow (divergence-free)    |
+| **Eo**      | Obstacle boundary       | Zero normal flow at walls                |
+| **Er**      | Regularization          | Smooth transitions between cells         |
+
+This allows real-time 2D approximation of Computational Fluid Dynamics (CFD) suitable for mobile robot applications.
+
+## Package Structure
+
+```
+GMRF-wind/
+├── gmrf_msgs/                  # Message definitions
+│   └── msg/
+│       └── WindEstimate.msg
+└── gmrf_wind_mapping/          # Core algorithm
+    ├── src/
+    │   └── gmrf_wind_mapping_node.cpp
+    └── scripts/
+```
+
+## Installation
+
+### Prerequisites
+
+```bash
+# ROS 2 Humble
+sudo apt install ros-humble-desktop
+
+# Eigen3
+sudo apt install libeigen3-dev
+```
+
+### Building
+
+```bash
+cd ~/Bio_ws
+colcon build --packages-select gmrf_msgs gmrf_wind_mapping
+source install/setup.bash
+```
+
+## Usage
+
+### Launch with GSExploration System
+
+The GMRF wind mapping node is launched as part of the main system:
+
+```bash
+ros2 launch main_decision demo_sim.py
+```
+
+### Standalone Launch
+
+```bash
+ros2 run gmrf_wind_mapping gmrf_wind_mapping_node \
+    --ros-args \
+    -p cell_size:=0.5 \
+    -p lambda_obs:=1.0 \
+    -p lambda_div:=0.1
+```
+
+## Parameters
+
+| Parameter         | Default | Description                            |
+| ----------------- | ------- | -------------------------------------- |
+| `cell_size`       | 0.5     | Grid resolution in meters              |
+| `lambda_obs`      | 1.0     | Weight for observation term (Ez)       |
+| `lambda_div`      | 0.1     | Weight for divergence-free term (Em)   |
+| `lambda_boundary` | 10.0    | Weight for obstacle boundary term (Eo) |
+| `lambda_reg`      | 0.01    | Regularization weight (Er)             |
+
+## Topics
+
+### Subscribed
+
+| Topic         | Type                        | Description                 |
+| ------------- | --------------------------- | --------------------------- |
+| `/anemometer` | `olfaction_msgs/Anemometer` | Wind sensor measurements    |
+| `/map`        | `nav_msgs/OccupancyGrid`    | Occupancy map for obstacles |
+
+### Published
+
+| Topic            | Type                             | Description               |
+| ---------------- | -------------------------------- | ------------------------- |
+| `/wind_field`    | `visualization_msgs/MarkerArray` | Wind vector visualization |
+| `/gmrf/wind_map` | `gmrf_msgs/WindEstimate`         | Wind field estimate       |
+
+## Integration
+
+Used by the following GSExploration components:
+
+- `scoring_node` — Wind probability calculation for region scoring
+- `gsl_local_search` — Upwind direction for Surge-Cast algorithm
+
+## Dependencies
+
+### ROS 2 Packages
+
+- `rclcpp` — ROS 2 C++ client library
+- `olfaction_msgs` — Anemometer message types
+- `nav_msgs` — Occupancy grid
+- `visualization_msgs` — RViz markers
+
+### External Libraries
+
+- `Eigen3` — Linear algebra operations
+
+## Citation
+
+If you use this package in your research, please cite:
+
+```bibtex
 @INPROCEEDINGS{jmonroy_isoen_2017,
      author = {Monroy, Javier and Jaimez, Mariano and Gonzalez-Jimenez, Javier},
       title = {Online Estimation of 2D Wind Maps for Olfactory Robots},
@@ -19,5 +140,14 @@ If it is relevant to your research, you can cite the paper with the following Bi
         doi = {10.1109/ISOEN.2017.7968883},
       pages = {1--3}
 }
+```
 
-Although GMRF-W is a self-contained pkg, the implementation considers anemometer sensor readings which depends on an external pkg defining some "olfaction" related msgs. This pkg is available in a different repository named olfaction_msgs (https://github.com/MAPIRlab/olfaction_msgs).
+## License
+
+GPL-3.0 (See LICENSE file)
+
+## Related Documentation
+
+- [System Architecture](../documents/knowledge-architecture.md)
+- [Domain Glossary](../documents/business/business-glossary.md)
+- [Feature Specifications](../documents/business/business-features.md)
