@@ -40,7 +40,7 @@ namespace Utils
 
         nav_msgs::msg::OccupancyGrid occupancyGrid;
         occupancyGrid.data.resize(width * height);
-        for (int i = 0; i < width * height; i++)
+        for (size_t i = 0; i < width * height; i++)
             occupancyGrid.data[i] = (int8_t)(100 - std::clamp((int)mapImage.data[i], 0, 100));
 
         return occupancyGrid;

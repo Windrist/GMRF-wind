@@ -46,11 +46,6 @@ Cgmrf::Cgmrf()
         "GMRF_lambdaObsLoss", 0.0); // [GMRF model] The loss of information (Lambda) of the observations with each iteration (see AppTick)
 
     colormap = declare_parameter<std::string>("colormap", "jet");
-    max_pclpoints_cell = declare_parameter<int>("max_pclpoints_cell", 20);
-    min_sensor_val = declare_parameter<double>("min_sensor_val", 0.0);
-    max_sensor_val = declare_parameter<double>("max_sensor_val", 0.0);
-
-    suggest_next_location_sensor_th = declare_parameter<double>("suggest_next_location_sensor_th", 0.1);
 
     //----------------------------------
     // Subscriptions
@@ -160,14 +155,11 @@ void Cgmrf::mapCallback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
 void Cgmrf::initialize()
 {
     // Set GasMap dimensions as the OccupancyMap
-    double map_min_x = occupancyMap.info.origin.position.x;
-    double map_max_x = occupancyMap.info.origin.position.x + occupancyMap.info.width * occupancyMap.info.resolution;
-    double map_min_y = occupancyMap.info.origin.position.y;
-    double map_max_y = occupancyMap.info.origin.position.y + occupancyMap.info.height * occupancyMap.info.resolution;
+    // Note: map bounds are calculated but only used for logging/debugging
 
     // Create GMRF-Map and init
     my_map = std::make_unique<CGMRF_map>(this, occupancyMap, cell_size, GMRF_lambdaPrior_reg, GMRF_lambdaPrior_mass_conservation,
-                                         GMRF_lambdaPrior_obstacles, colormap, max_pclpoints_cell, verbose, filter_unexplored_);
+                                         GMRF_lambdaPrior_obstacles, colormap, verbose, filter_unexplored_);
     RCLCPP_INFO(get_logger(), "[GMRF-node] GMRF GridMap initialized (filter_unexplored=%s)", filter_unexplored_ ? "true" : "false");
 
     module_init = true;
@@ -179,53 +171,55 @@ void Cgmrf::initialize()
 void Cgmrf::sensorCallback(const olfaction_msgs::msg::Anemometer::SharedPtr msg)
 {
     // 1. Get wind measurement
-    double downwind_direction_map;
-    mutex_anemometer.lock();
-    try
+    double downwind_direction_map = 0.0;
+    double local_speed = 0.0;
+
     {
-        reading_speed = msg->wind_speed;         // (m/s)
-        reading_direction = msg->wind_direction; // (rad) This is the Upwind direction with respect the Anemometer ref system (standard measurement)
-
-        // RCLCPP_INFO(get_logger(), "Speed:%f Direction:%f", reading_speed, reading_direction);
-        //  We need to transform this Upwind direction in the Anemometer ref system---- to ---- DownWind direction in the MAP ref system
-        if (reading_speed != 0.0)
+        std::lock_guard<std::mutex> lock(mutex_anemometer);
+        try
         {
-            // Transform from anemometer ref_system to the map ref_system using TF
-            geometry_msgs::msg::PoseStamped anemometer_upWind_pose, map_upWind_pose;
-            try
-            {
-                anemometer_upWind_pose.header = msg->header;
-                anemometer_upWind_pose.pose.position.x = 0.0;
-                anemometer_upWind_pose.pose.position.y = 0.0;
-                anemometer_upWind_pose.pose.position.z = 0.0;
-                anemometer_upWind_pose.pose.orientation = Utils::createQuaternionMsgFromYaw(-msg->wind_direction);
+            local_speed = msg->wind_speed;                     // (m/s)
+            reading_speed = local_speed;
+            reading_direction = msg->wind_direction;           // (rad) This is the Upwind direction with respect the Anemometer ref system (standard measurement)
 
-                // lookuptransform (target_frame, target_time, pose_in, fixed_frame, pose_out)
-                tf_buffer->transform(anemometer_upWind_pose, map_upWind_pose, frame_id.c_str());
-
-                downwind_direction_map = angles::normalize_angle(Utils::getYaw(map_upWind_pose.pose.orientation) + M_PI);
-            }
-            catch (const tf2::TransformException &ex)
+            // RCLCPP_INFO(get_logger(), "Speed:%f Direction:%f", reading_speed, reading_direction);
+            //  We need to transform this Upwind direction in the Anemometer ref system---- to ---- DownWind direction in the MAP ref system
+            if (local_speed != 0.0)
             {
-                RCLCPP_ERROR(get_logger(), "[GMRF] Transform error: %s", ex.what());
+                // Transform from anemometer ref_system to the map ref_system using TF
+                geometry_msgs::msg::PoseStamped anemometer_upWind_pose, map_upWind_pose;
+                try
+                {
+                    anemometer_upWind_pose.header = msg->header;
+                    anemometer_upWind_pose.pose.position.x = 0.0;
+                    anemometer_upWind_pose.pose.position.y = 0.0;
+                    anemometer_upWind_pose.pose.position.z = 0.0;
+                    anemometer_upWind_pose.pose.orientation = Utils::createQuaternionMsgFromYaw(-msg->wind_direction);
+
+                    // lookuptransform (target_frame, target_time, pose_in, fixed_frame, pose_out)
+                    tf_buffer->transform(anemometer_upWind_pose, map_upWind_pose, frame_id.c_str());
+
+                    downwind_direction_map = angles::normalize_angle(Utils::getYaw(map_upWind_pose.pose.orientation) + M_PI);
+                }
+                catch (const tf2::TransformException &ex)
+                {
+                    RCLCPP_ERROR(get_logger(), "[GMRF] Transform error: %s", ex.what());
+                    return; // Exit early if transform fails
+                }
             }
         }
-        else
+        catch (const std::exception &e)
         {
-            downwind_direction_map = 0.0;
+            RCLCPP_ERROR(get_logger(), "[GMRF] Exception at new Obs: %s", e.what());
+            return;
         }
-    }
-    catch (const std::exception &e)
-    {
-        RCLCPP_ERROR(get_logger(), "[GMRF] Exception at new Obs: %s", e.what());
-    }
-    mutex_anemometer.unlock();
+    } // lock released here
+
     // RCLCPP_INFO(get_logger(), "[GMRF-node] New wind observation! %.2f m/s  %.2f rad (DownWind in the map ref system)",msg->wind_speed,
     // downwind_direction_map);
 
     // 2. Get pose of the sensor in the map reference system
     geometry_msgs::msg::TransformStamped transform;
-    bool know_sensor_pose = true;
     try
     {
         // lookuptransform (target_frame, source_frame, result_tf)
@@ -234,7 +228,7 @@ void Cgmrf::sensorCallback(const olfaction_msgs::msg::Anemometer::SharedPtr msg)
     catch (const tf2::TransformException &ex)
     {
         RCLCPP_ERROR(get_logger(), "[GMRF] Exception reading observation: %s", ex.what());
-        know_sensor_pose = false;
+        return; // Exit early if we can't get sensor pose
     }
 
     // 3. Add observation to the GMRF map
@@ -244,10 +238,9 @@ void Cgmrf::sensorCallback(const olfaction_msgs::msg::Anemometer::SharedPtr msg)
         float x_pos = transform.transform.translation.x;
         float y_pos = transform.transform.translation.y;
 
-        mutex_anemometer.lock();
+        std::lock_guard<std::mutex> lock(mutex_anemometer);
         // RCLCPP_INFO(get_logger(), "[GMRF] New obs: %.2f m/s, %.2f rad at (%.2f,%.2f)", reading_speed,reading_direction,x_pos,y_pos);
-        my_map->insertObservation_GMRF(reading_speed, downwind_direction_map, x_pos, y_pos, GMRF_lambdaObs);
-        mutex_anemometer.unlock();
+        my_map->insertObservation_GMRF(local_speed, downwind_direction_map, x_pos, y_pos, GMRF_lambdaObs);
     }
 }
 
@@ -277,9 +270,9 @@ bool Cgmrf::get_wind_value_srv(WindEstimation::Request::SharedPtr req, WindEstim
         res->v.reserve(size);
         res->stdev_angle.reserve(size);
 
-        for (int i = 0; i < size; i++)
+        for (size_t i = 0; i < size; i++)
         {
-            WindVector r = my_map->getEstimation(i);
+            WindVector r = my_map->getEstimation(static_cast<int>(i));
             Eigen::Vector2d vec = r.asEigen();
             res->u.push_back(vec.x());
             res->v.push_back(vec.y());
@@ -290,7 +283,7 @@ bool Cgmrf::get_wind_value_srv(WindEstimation::Request::SharedPtr req, WindEstim
     }
 
     // Since the wind fields are identical among different instances, return just the information from instance[0]
-    for (int i = 0; i < req->x.size(); i++)
+    for (size_t i = 0; i < req->x.size(); i++)
     {
         WindVector r = my_map->getEstimation(req->x[i], req->y[i]);
         Eigen::Vector2d vec = r.asEigen();

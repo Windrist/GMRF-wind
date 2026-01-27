@@ -1,12 +1,14 @@
 #include "gmrf_map.h"
 #include "Utils.h"
+#include <algorithm>
+#include <cstdlib>
 #include <limits>
 
 /*---------------------------------------------------------------
                         Constructor
   ---------------------------------------------------------------*/
 CGMRF_map::CGMRF_map(rclcpp::Node *_node, const nav_msgs::msg::OccupancyGrid &oc_map, float cell_size, double m_lambdaPrior_reg,
-                     double m_lambdaPrior_mass_conservation, double m_lambdaPrior_obstacles, std::string m_colormap, int max_points_cell,
+                     double m_lambdaPrior_mass_conservation, double m_lambdaPrior_obstacles, std::string /* m_colormap */,
                      bool verbose, bool filter_unexplored)
     : node(_node), verbose(verbose), filter_unexplored_(filter_unexplored)
 {
@@ -132,12 +134,11 @@ std::vector<SavedObservation> CGMRF_map::getActiveObservations() const
     {
         SavedObservation s;
         // Convert cell index back to world coordinates
-        double x, y;
         size_t cell_x = obs.cell_idx % m_size_x;
         size_t cell_y = obs.cell_idx / m_size_x;
         s.x_pos = m_x_min + (cell_x * m_resolution) + (m_resolution / 2);
         s.y_pos = m_y_min + (cell_y * m_resolution) + (m_resolution / 2);
-        s.wind_speed = sqrt(obs.windX * obs.windX + obs.windY * obs.windY);
+        s.wind_speed = std::hypot(obs.windX, obs.windY);
         s.wind_direction = atan2(obs.windY, obs.windX);
         s.lambda = obs.lambda;
         s.time_invariant = obs.time_invariant;
@@ -586,6 +587,11 @@ void CGMRF_map::id2xy(size_t id, double &x, double &y)
 /*---------------------------------------------------------------
              Check if a cell is free of obstacles
   ---------------------------------------------------------------*/
+// Occupancy threshold constants
+static constexpr int8_t OCCUPANCY_FREE_THRESHOLD = 50;
+static constexpr int8_t OCCUPANCY_OBSTACLE_THRESHOLD_H = 60;
+static constexpr int8_t OCCUPANCY_OBSTACLE_THRESHOLD_V = 50;
+
 // Check at OccupancyMap level, if a cell is free of obstacles (checking the cell center at GMRF resolution)
 bool CGMRF_map::is_cell_free(size_t id_gmrf)
 {
@@ -599,15 +605,13 @@ bool CGMRF_map::is_cell_free(size_t id_gmrf)
     id_oc = static_cast<int>((cell_1_x - m_Ocgridmap.info.origin.position.x) / m_Ocgridmap.info.resolution);                           // x component
     id_oc += static_cast<int>((cell_1_y - m_Ocgridmap.info.origin.position.y) / m_Ocgridmap.info.resolution) * m_Ocgridmap.info.width; // y component
 
-    try
+    // Bounds check to prevent undefined behavior
+    if (id_oc < 0 || static_cast<size_t>(id_oc) >= m_Ocgridmap.data.size())
     {
-        return m_Ocgridmap.data[id_oc] < 50.0;
+        return false; // Out of bounds = not free
     }
-    catch (const std::exception &e)
-    {
-        RCLCPP_ERROR(node->get_logger(), "[GMRF] Exception checking cell freedom: %s", e.what());
-        return false;
-    }
+
+    return m_Ocgridmap.data[id_oc] < OCCUPANCY_FREE_THRESHOLD;
 }
 
 /*---------------------------------------------------------------
@@ -626,27 +630,15 @@ bool CGMRF_map::is_cell_explored(size_t id_gmrf)
     id_oc = static_cast<int>((cell_1_x - m_Ocgridmap.info.origin.position.x) / m_Ocgridmap.info.resolution);
     id_oc += static_cast<int>((cell_1_y - m_Ocgridmap.info.origin.position.y) / m_Ocgridmap.info.resolution) * m_Ocgridmap.info.width;
 
-    try
+    // Check if index is valid
+    if (id_oc < 0 || static_cast<size_t>(id_oc) >= m_Ocgridmap.data.size())
     {
-        // Check if index is valid
-        if (id_oc < 0 || static_cast<size_t>(id_oc) >= m_Ocgridmap.data.size())
-        {
-            return false; // Out of bounds = unexplored
-        }
+        return false; // Out of bounds = unexplored
+    }
 
-        // Check if cell is unknown (-1 indicates unexplored in OccupancyGrid)
-        // Some implementations use values < 0 for unknown
-        if (m_Ocgridmap.data[id_oc] < 0)
-        {
-            return false; // Unexplored
-        }
-        return true;
-    }
-    catch (const std::exception &e)
-    {
-        RCLCPP_ERROR(node->get_logger(), "[GMRF] Exception checking cell exploration: %s", e.what());
-        return false;
-    }
+    // Check if cell is unknown (-1 indicates unexplored in OccupancyGrid)
+    // Some implementations use values < 0 for unknown
+    return m_Ocgridmap.data[id_oc] >= 0;
 }
 
 /*---------------------------------------------------------------
@@ -656,60 +648,57 @@ bool CGMRF_map::is_cell_explored(size_t id_gmrf)
 // If ture, we will set a regularization factor.
 bool CGMRF_map::check_connectivity_between2cells(size_t idx_1_gmrf, size_t idx_2_gmrf)
 {
-    try
+    // Get poses (x,y) of the cell centers in GMRF map
+    double cell_1_x, cell_1_y, cell_2_x, cell_2_y;
+    id2xy(idx_1_gmrf, cell_1_x, cell_1_y);
+    id2xy(idx_2_gmrf, cell_2_x, cell_2_y);
+
+    // Get corresponding cell_idx in the Occupancy Gridmap
+    // IMPORTANT --> Use the resolution and size of Occupancy Gridmap (not the GMRF)
+    int idx_1_oc, idx_2_oc;
+    idx_1_oc = static_cast<int>((cell_1_x - m_Ocgridmap.info.origin.position.x) / m_Ocgridmap.info.resolution); // x component
+    idx_1_oc +=
+        static_cast<int>((cell_1_y - m_Ocgridmap.info.origin.position.y) / m_Ocgridmap.info.resolution) * m_Ocgridmap.info.width; // y component
+    idx_2_oc = static_cast<int>((cell_2_x - m_Ocgridmap.info.origin.position.x) / m_Ocgridmap.info.resolution);                   // x component
+    idx_2_oc +=
+        static_cast<int>((cell_2_y - m_Ocgridmap.info.origin.position.y) / m_Ocgridmap.info.resolution) * m_Ocgridmap.info.width; // y component
+
+    // Bounds validation
+    const size_t map_size = m_Ocgridmap.data.size();
+    if (idx_1_oc < 0 || idx_2_oc < 0 ||
+        static_cast<size_t>(idx_1_oc) >= map_size || static_cast<size_t>(idx_2_oc) >= map_size)
     {
-        // Ge poses (x,y) of the cell centers in GMRF map
-        double cell_1_x, cell_1_y, cell_2_x, cell_2_y;
-        id2xy(idx_1_gmrf, cell_1_x, cell_1_y);
-        id2xy(idx_2_gmrf, cell_2_x, cell_2_y);
+        return false; // Out of bounds = not connected
+    }
 
-        // Get corresponding cell_idx in the Occupancy Gridmap
-        // IMPORTANT --> Use the resolution and size of Occupancy Gridmap (not the GMRF)
-        int idx_1_oc, idx_2_oc;
-        idx_1_oc = static_cast<int>((cell_1_x - m_Ocgridmap.info.origin.position.x) / m_Ocgridmap.info.resolution); // x component
-        idx_1_oc +=
-            static_cast<int>((cell_1_y - m_Ocgridmap.info.origin.position.y) / m_Ocgridmap.info.resolution) * m_Ocgridmap.info.width; // y component
-        idx_2_oc = static_cast<int>((cell_2_x - m_Ocgridmap.info.origin.position.x) / m_Ocgridmap.info.resolution);                   // x component
-        idx_2_oc +=
-            static_cast<int>((cell_2_y - m_Ocgridmap.info.origin.position.y) / m_Ocgridmap.info.resolution) * m_Ocgridmap.info.width; // y component
+    // check if cells are in the same row of the GMRF map
+    const bool horizontal = (idx_2_gmrf == idx_1_gmrf + 1);
 
-        // check if cells are in the same row of the GMRF map
-        bool horizontal = false;
-        if (idx_2_gmrf == idx_1_gmrf + 1)
-            horizontal = true;
-
-        // Check that a straigh line between both cells centers is free of obstacles
-        bool connected = true;
-        if (horizontal)
+    // Check that a straight line between both cells centers is free of obstacles
+    if (horizontal)
+    {
+        for (size_t p = idx_1_oc; p < static_cast<size_t>(idx_2_oc); p++)
         {
-            for (size_t p = idx_1_oc; p < idx_2_oc; p++)
+            if (p >= map_size) return false;
+            if (m_Ocgridmap.data[p] >= OCCUPANCY_OBSTACLE_THRESHOLD_H)
             {
-                if (m_Ocgridmap.data[p] >= 60.0)
-                {
-                    connected = false;
-                    break;
-                }
+                return false;
             }
         }
-        else
+    }
+    else
+    {
+        for (size_t p = idx_1_oc; p < static_cast<size_t>(idx_2_oc); p += m_Ocgridmap.info.width)
         {
-            for (size_t p = idx_1_oc; p < idx_2_oc; p += m_Ocgridmap.info.width)
+            if (p >= map_size) return false;
+            if (m_Ocgridmap.data[p] >= OCCUPANCY_OBSTACLE_THRESHOLD_V)
             {
-                if (m_Ocgridmap.data[p] >= 50.0)
-                {
-                    connected = false;
-                    break;
-                }
+                return false;
             }
         }
+    }
 
-        return connected;
-    }
-    catch (const std::exception &e)
-    {
-        RCLCPP_ERROR(node->get_logger(), "[GMRF] Exception checking cell connectivity: %s", e.what());
-        return false;
-    }
+    return true;
 }
 
 /*---------------------------------------------------------------
@@ -721,7 +710,7 @@ void CGMRF_map::insertObservation_GMRF(double wind_speed, double wind_direction,
     {
         auto add_obs = [this](const TobservationGMRF &observation)
         {
-            if (observation.cell_idx < 0 || observation.cell_idx > N)
+            if (observation.cell_idx >= N)
             {
                 RCLCPP_ERROR(node->get_logger(), "Observation is outside of the map!");
                 return;
@@ -884,12 +873,23 @@ void CGMRF_map::updateMapEstimation_GMRF(float lambdaObsLoss)
 
         // 4. SOLVE
         // We need to solve: H * inc_m = -G
-        // In an interative scenario: m = m + inc_m;
+        // In an iterative scenario: m = m + inc_m;
         // In our case, we do not need to consider the previous state, so m = inc_m
         // We use a Cholesky Factorization of Hessian --> chol( P * H * inv(P) )
         Eigen::SimplicialLLT<Eigen::SparseMatrix<double>> solver;
         solver.compute(Hsparse);
+        if (solver.info() != Eigen::Success)
+        {
+            RCLCPP_ERROR(node->get_logger(), "[GMRF] Cholesky decomposition failed!");
+            return;
+        }
+
         Eigen::VectorXd m_inc = solver.solve(G);
+        if (solver.info() != Eigen::Success)
+        {
+            RCLCPP_ERROR(node->get_logger(), "[GMRF] Linear system solve failed!");
+            return;
+        }
 
         if (verbose)
             RCLCPP_INFO(node->get_logger(), "[GMRF] System solved with solution size (%lu,%lu)", m_inc.rows(), m_inc.cols());
@@ -936,9 +936,9 @@ WindVector CGMRF_map::getEstimation(int index)
         return {0.0, 0.0, std::numeric_limits<double>::max()}; // Return invalid/zero wind with max uncertainty
     }
 
-    double module = sqrt(pow(m_map[index].mean, 2) + pow(m_map[index + N].mean, 2));
+    double module = std::hypot(m_map[index].mean, m_map[index + N].mean);
     double direction = atan2(m_map[index + N].mean, m_map[index].mean);
-    double stdev = std::max(0.1, sqrt(pow(m_map[index].std, 2) + pow(m_map[index + N].std, 2)));
+    double stdev = std::max(0.1, std::hypot(m_map[index].std, m_map[index + N].std));
 
     return {module, direction, stdev};
 }
@@ -1033,28 +1033,44 @@ void CGMRF_map::get_as_markerArray(visualization_msgs::msg::MarkerArray &ma, std
 
         // Get max wind vector in the map (to normalize the plot)
         // Only consider explored cells when filtering is enabled
+        // Pre-compute exploration status to avoid repeated expensive lookups
+        std::vector<bool> cell_explored(N, true);
+        if (filter_unexplored_)
+        {
+            for (size_t i = 0; i < N; i++)
+            {
+                cell_explored[i] = is_cell_explored(i);
+            }
+        }
+
         double max_module = 0.0;
         for (size_t i = 0; i < N; i++)
         {
             // Skip unexplored cells when filtering is enabled
-            if (filter_unexplored_ && !is_cell_explored(i))
+            if (filter_unexplored_ && !cell_explored[i])
                 continue;
 
-            if (sqrt(pow(m_map[i].mean, 2) + pow(m_map[i + N].mean, 2) > max_module))
-                max_module = sqrt(pow(m_map[i].mean, 2) + pow(m_map[i + N].mean, 2));
+            const double module = std::hypot(m_map[i].mean, m_map[i + N].mean);
+            if (module > max_module)
+                max_module = module;
         }
+
+        // Prevent division by zero
+        static constexpr double MIN_WIND_MODULE = 0.001;
+        if (max_module < MIN_WIND_MODULE)
+            max_module = MIN_WIND_MODULE;
 
         for (size_t i = 0; i < N; i++)
         {
             // Skip unexplored cells when filtering is enabled
-            if (filter_unexplored_ && !is_cell_explored(i))
+            if (filter_unexplored_ && !cell_explored[i])
                 continue;
 
             // if (is_cell_free(i))
             {
-                double module = sqrt(pow(m_map[i].mean, 2) + pow(m_map[i + N].mean, 2));
+                const double module = std::hypot(m_map[i].mean, m_map[i + N].mean);
                 // RCLCPP_INFO(node->get_logger(), "[GMRF] wind(%lu)=(%.2f,%.2f)m/s",i,m_map[i].mean,m_map[i+N].mean );
-                if (module > 0.001)
+                if (module > MIN_WIND_MODULE)
                 {
                     // Set the pose of the marker.
                     marker.id = i + 10;
@@ -1084,6 +1100,10 @@ void CGMRF_map::get_as_markerArray(visualization_msgs::msg::MarkerArray &ma, std
 
 void CGMRF_map::save_grmf_factor_graph(std::vector<Eigen::Triplet<double>> &Jout, std::vector<Eigen::Triplet<double>> &Aout, Eigen::VectorXd &yout)
 {
+    // Get output directory from environment or use /tmp as fallback
+    const char* home_dir = std::getenv("HOME");
+    std::string output_dir = home_dir ? std::string(home_dir) : "/tmp";
+
     bool save_dense = true;
     bool save_sparse = true;
     if (save_dense)
@@ -1096,7 +1116,7 @@ void CGMRF_map::save_grmf_factor_graph(std::vector<Eigen::Triplet<double>> &Jout
         // define the format you want, you only need one instance of this...
         const static Eigen::IOFormat CSVFormat(Eigen::StreamPrecision, Eigen::DontAlignCols, ", ", "\n");
         // RCLCPP_INFO(node->get_logger(), "[GMRF] Saving Factor-Graph to file...");
-        std::ofstream file("/home/jgmonroy/gmrf_jacobian_dense.txt");
+        std::ofstream file(output_dir + "/gmrf_jacobian_dense.txt");
         if (file.is_open())
         {
             file << Jdense.format(CSVFormat) << '\n';
@@ -1107,7 +1127,7 @@ void CGMRF_map::save_grmf_factor_graph(std::vector<Eigen::Triplet<double>> &Jout
         Eigen::SparseMatrix<double> Asparse(nFactors, nFactors); // declares a column-major sparse matrix type of float
         Asparse.setFromTriplets(Aout.begin(), Aout.end());
         Eigen::MatrixXd Adense = Asparse.toDense();
-        std::ofstream file2("/home/jgmonroy/gmrf_lambda_dense.txt");
+        std::ofstream file2(output_dir + "/gmrf_lambda_dense.txt");
         if (file2.is_open())
         {
             file2 << Adense.format(CSVFormat) << '\n';
@@ -1121,7 +1141,7 @@ void CGMRF_map::save_grmf_factor_graph(std::vector<Eigen::Triplet<double>> &Jout
         RCLCPP_INFO(node->get_logger(), "[GMRF] Jtriplets(%lu,3), Atriplets(%lu,3), numFactors(%lu)", Jout.size(), Aout.size(), yout.rows());
 
         // 1. Jacobian
-        std::ofstream file("/home/jgmonroy/gmrf_Jacobian.txt");
+        std::ofstream file(output_dir + "/gmrf_Jacobian.txt");
         if (file.is_open())
         {
             file << "# Jacobian of the GMRF: row col value"
@@ -1137,7 +1157,7 @@ void CGMRF_map::save_grmf_factor_graph(std::vector<Eigen::Triplet<double>> &Jout
         file.close();
 
         // 2. Information Matrix
-        std::ofstream file2("/home/jgmonroy/gmrf_Lambda.txt");
+        std::ofstream file2(output_dir + "/gmrf_Lambda.txt");
         if (file2.is_open())
         {
             for (std::vector<Eigen::Triplet<double>>::iterator it = Aout.begin(); it != Aout.end(); it++)
@@ -1148,7 +1168,7 @@ void CGMRF_map::save_grmf_factor_graph(std::vector<Eigen::Triplet<double>> &Jout
         file2.close();
 
         // 3. Save vector of observations
-        std::ofstream file3("/home/jgmonroy/gmrf_observations.txt");
+        std::ofstream file3(output_dir + "/gmrf_observations.txt");
         if (file3.is_open())
         {
             file3 << yout;
@@ -1160,8 +1180,12 @@ void CGMRF_map::save_grmf_factor_graph(std::vector<Eigen::Triplet<double>> &Jout
 // Save Sparse matrices to file (for debug)
 void CGMRF_map::save_grmf_factor_graph(Eigen::SparseMatrix<double> &H, Eigen::VectorXd &G)
 {
+    // Get output directory from environment or use /tmp as fallback
+    const char* home_dir = std::getenv("HOME");
+    std::string output_dir = home_dir ? std::string(home_dir) : "/tmp";
+
     // 1. Hessian
-    std::ofstream file("/home/jgmonroy/gmrf_hessian.txt");
+    std::ofstream file(output_dir + "/gmrf_hessian.txt");
     if (file.is_open())
     {
         file << "# Hessian of the GMRF: row col value"
@@ -1182,7 +1206,7 @@ void CGMRF_map::save_grmf_factor_graph(Eigen::SparseMatrix<double> &H, Eigen::Ve
     Eigen::MatrixXd Hdense = H.toDense();
     // define the format you want, you only need one instance of this...
     const static Eigen::IOFormat CSVFormat(Eigen::StreamPrecision, Eigen::DontAlignCols, ", ", "\n");
-    std::ofstream file3("/home/jgmonroy/gmrf_hessian_dense.txt");
+    std::ofstream file3(output_dir + "/gmrf_hessian_dense.txt");
     if (file3.is_open())
     {
         file3 << Hdense.format(CSVFormat) << '\n';
@@ -1190,7 +1214,7 @@ void CGMRF_map::save_grmf_factor_graph(Eigen::SparseMatrix<double> &H, Eigen::Ve
     file3.close();
 
     // 2. Gradient
-    std::ofstream file2("/home/jgmonroy/gmrf_gradient.txt");
+    std::ofstream file2(output_dir + "/gmrf_gradient.txt");
     if (file2.is_open())
     {
         file2 << G;
@@ -1203,85 +1227,83 @@ void CGMRF_map::save_grmf_factor_graph(Eigen::SparseMatrix<double> &H, Eigen::Ve
 //------------------------------------------
 void CGMRF_map::init_colormaps(std::string colormap)
 {
-    if (colormap.compare("jet") == 0)
-    {
-        float temp_color_r[200] = {
-            0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
-            0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
-            0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
-            0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.14, 0.16, 0.18, 0.20, 0.22, 0.24, 0.26, 0.28, 0.30, 0.32, 0.34,
-            0.36, 0.38, 0.40, 0.42, 0.44, 0.46, 0.48, 0.50, 0.52, 0.54, 0.56, 0.58, 0.60, 0.62, 0.64, 0.66, 0.68, 0.70, 0.72, 0.74, 0.76, 0.78, 0.80,
-            0.82, 0.84, 0.86, 0.88, 0.90, 0.92, 0.94, 0.96, 0.98, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
-            1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
-            1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 0.98, 0.96, 0.94, 0.92, 0.90, 0.88, 0.86, 0.84, 0.82,
-            0.80, 0.78, 0.76, 0.74, 0.72, 0.70, 0.68, 0.66, 0.64, 0.62, 0.60, 0.58, 0.56, 0.54, 0.52, 0.50};
-        float temp_color_g[200] = {
-            0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
-            0.00, 0.00, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.14, 0.16, 0.18, 0.20, 0.22, 0.24, 0.26, 0.28, 0.30, 0.32, 0.34, 0.36, 0.38, 0.40, 0.42,
-            0.44, 0.46, 0.48, 0.50, 0.52, 0.54, 0.56, 0.58, 0.60, 0.62, 0.64, 0.66, 0.68, 0.70, 0.72, 0.74, 0.76, 0.78, 0.80, 0.82, 0.84, 0.86, 0.88,
-            0.90, 0.92, 0.94, 0.96, 0.98, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
-            1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
-            1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 0.98, 0.96, 0.94, 0.92, 0.90, 0.88, 0.86, 0.84, 0.82, 0.80, 0.78, 0.76, 0.74,
-            0.72, 0.70, 0.68, 0.66, 0.64, 0.62, 0.60, 0.58, 0.56, 0.54, 0.52, 0.50, 0.48, 0.46, 0.44, 0.42, 0.40, 0.38, 0.36, 0.34, 0.32, 0.30, 0.28,
-            0.26, 0.24, 0.22, 0.20, 0.18, 0.16, 0.14, 0.12, 0.10, 0.08, 0.06, 0.04, 0.02, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
-            0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00};
-        float temp_color_b[200] = {
-            0.52, 0.54, 0.56, 0.58, 0.60, 0.62, 0.64, 0.66, 0.68, 0.70, 0.72, 0.74, 0.76, 0.78, 0.80, 0.82, 0.84, 0.86, 0.88, 0.90, 0.92, 0.94, 0.96,
-            0.98, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
-            1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
-            1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 0.98, 0.96, 0.94, 0.92, 0.90, 0.88, 0.86, 0.84, 0.82, 0.80, 0.78, 0.76, 0.74, 0.72, 0.70, 0.68, 0.66,
-            0.64, 0.62, 0.60, 0.58, 0.56, 0.54, 0.52, 0.50, 0.48, 0.46, 0.44, 0.42, 0.40, 0.38, 0.36, 0.34, 0.32, 0.30, 0.28, 0.26, 0.24, 0.22, 0.20,
-            0.18, 0.16, 0.14, 0.12, 0.10, 0.08, 0.06, 0.04, 0.02, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
-            0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
-            0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
-            0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00};
-        for (int ix = 0; ix < 200; ix++)
-        {
-            color_r[ix] = temp_color_r[ix];
-            color_g[ix] = temp_color_g[ix];
-            color_b[ix] = temp_color_b[ix];
-        }
-    }
-    else if (colormap.compare("hot") == 0)
-    {
-        float temp_color_r[200] = {
-            0.01, 0.03, 0.04, 0.05, 0.07, 0.08, 0.09, 0.11, 0.12, 0.13, 0.15, 0.16, 0.17, 0.19, 0.20, 0.21, 0.23, 0.24, 0.25, 0.27, 0.28, 0.29, 0.31,
-            0.32, 0.33, 0.35, 0.36, 0.37, 0.39, 0.40, 0.41, 0.43, 0.44, 0.45, 0.47, 0.48, 0.49, 0.51, 0.52, 0.53, 0.55, 0.56, 0.57, 0.59, 0.60, 0.61,
-            0.63, 0.64, 0.65, 0.67, 0.68, 0.69, 0.71, 0.72, 0.73, 0.75, 0.76, 0.77, 0.79, 0.80, 0.81, 0.83, 0.84, 0.85, 0.87, 0.88, 0.89, 0.91, 0.92,
-            0.93, 0.95, 0.96, 0.97, 0.99, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
-            1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
-            1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
-            1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
-            1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
-            1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00};
-        float temp_color_g[200] = {
-            0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
-            0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
-            0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
-            0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.01, 0.03, 0.04, 0.05, 0.07, 0.08, 0.09, 0.11, 0.12, 0.13, 0.15, 0.16, 0.17, 0.19, 0.20, 0.21, 0.23,
-            0.24, 0.25, 0.27, 0.28, 0.29, 0.31, 0.32, 0.33, 0.35, 0.36, 0.37, 0.39, 0.40, 0.41, 0.43, 0.44, 0.45, 0.47, 0.48, 0.49, 0.51, 0.52, 0.53,
-            0.55, 0.56, 0.57, 0.59, 0.60, 0.61, 0.63, 0.64, 0.65, 0.67, 0.68, 0.69, 0.71, 0.72, 0.73, 0.75, 0.76, 0.77, 0.79, 0.80, 0.81, 0.83, 0.84,
-            0.85, 0.87, 0.88, 0.89, 0.91, 0.92, 0.93, 0.95, 0.96, 0.97, 0.99, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
-            1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
-            1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00};
-        float temp_color_b[200] = {
-            0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
-            0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
-            0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
-            0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
-            0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
-            0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
-            0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.14, 0.16, 0.18, 0.20, 0.22,
-            0.24, 0.26, 0.28, 0.30, 0.32, 0.34, 0.36, 0.38, 0.40, 0.42, 0.44, 0.46, 0.48, 0.50, 0.52, 0.54, 0.56, 0.58, 0.60, 0.62, 0.64, 0.66, 0.68,
-            0.70, 0.72, 0.74, 0.76, 0.78, 0.80, 0.82, 0.84, 0.86, 0.88, 0.90, 0.92, 0.94, 0.96, 0.98, 1.00};
+    // Static constexpr colormap arrays to avoid stack allocation
+    static constexpr float jet_color_r[200] = {
+        0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
+        0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
+        0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
+        0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.14, 0.16, 0.18, 0.20, 0.22, 0.24, 0.26, 0.28, 0.30, 0.32, 0.34,
+        0.36, 0.38, 0.40, 0.42, 0.44, 0.46, 0.48, 0.50, 0.52, 0.54, 0.56, 0.58, 0.60, 0.62, 0.64, 0.66, 0.68, 0.70, 0.72, 0.74, 0.76, 0.78, 0.80,
+        0.82, 0.84, 0.86, 0.88, 0.90, 0.92, 0.94, 0.96, 0.98, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
+        1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
+        1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 0.98, 0.96, 0.94, 0.92, 0.90, 0.88, 0.86, 0.84, 0.82,
+        0.80, 0.78, 0.76, 0.74, 0.72, 0.70, 0.68, 0.66, 0.64, 0.62, 0.60, 0.58, 0.56, 0.54, 0.52, 0.50};
+    static constexpr float jet_color_g[200] = {
+        0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
+        0.00, 0.00, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.14, 0.16, 0.18, 0.20, 0.22, 0.24, 0.26, 0.28, 0.30, 0.32, 0.34, 0.36, 0.38, 0.40, 0.42,
+        0.44, 0.46, 0.48, 0.50, 0.52, 0.54, 0.56, 0.58, 0.60, 0.62, 0.64, 0.66, 0.68, 0.70, 0.72, 0.74, 0.76, 0.78, 0.80, 0.82, 0.84, 0.86, 0.88,
+        0.90, 0.92, 0.94, 0.96, 0.98, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
+        1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
+        1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 0.98, 0.96, 0.94, 0.92, 0.90, 0.88, 0.86, 0.84, 0.82, 0.80, 0.78, 0.76, 0.74,
+        0.72, 0.70, 0.68, 0.66, 0.64, 0.62, 0.60, 0.58, 0.56, 0.54, 0.52, 0.50, 0.48, 0.46, 0.44, 0.42, 0.40, 0.38, 0.36, 0.34, 0.32, 0.30, 0.28,
+        0.26, 0.24, 0.22, 0.20, 0.18, 0.16, 0.14, 0.12, 0.10, 0.08, 0.06, 0.04, 0.02, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
+        0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00};
+    static constexpr float jet_color_b[200] = {
+        0.52, 0.54, 0.56, 0.58, 0.60, 0.62, 0.64, 0.66, 0.68, 0.70, 0.72, 0.74, 0.76, 0.78, 0.80, 0.82, 0.84, 0.86, 0.88, 0.90, 0.92, 0.94, 0.96,
+        0.98, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
+        1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
+        1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 0.98, 0.96, 0.94, 0.92, 0.90, 0.88, 0.86, 0.84, 0.82, 0.80, 0.78, 0.76, 0.74, 0.72, 0.70, 0.68, 0.66,
+        0.64, 0.62, 0.60, 0.58, 0.56, 0.54, 0.52, 0.50, 0.48, 0.46, 0.44, 0.42, 0.40, 0.38, 0.36, 0.34, 0.32, 0.30, 0.28, 0.26, 0.24, 0.22, 0.20,
+        0.18, 0.16, 0.14, 0.12, 0.10, 0.08, 0.06, 0.04, 0.02, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
+        0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
+        0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
+        0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00};
 
-        for (int ix = 0; ix < 200; ix++)
-        {
-            color_r[ix] = temp_color_r[ix];
-            color_g[ix] = temp_color_g[ix];
-            color_b[ix] = temp_color_b[ix];
-        }
+    static constexpr float hot_color_r[200] = {
+        0.01, 0.03, 0.04, 0.05, 0.07, 0.08, 0.09, 0.11, 0.12, 0.13, 0.15, 0.16, 0.17, 0.19, 0.20, 0.21, 0.23, 0.24, 0.25, 0.27, 0.28, 0.29, 0.31,
+        0.32, 0.33, 0.35, 0.36, 0.37, 0.39, 0.40, 0.41, 0.43, 0.44, 0.45, 0.47, 0.48, 0.49, 0.51, 0.52, 0.53, 0.55, 0.56, 0.57, 0.59, 0.60, 0.61,
+        0.63, 0.64, 0.65, 0.67, 0.68, 0.69, 0.71, 0.72, 0.73, 0.75, 0.76, 0.77, 0.79, 0.80, 0.81, 0.83, 0.84, 0.85, 0.87, 0.88, 0.89, 0.91, 0.92,
+        0.93, 0.95, 0.96, 0.97, 0.99, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
+        1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
+        1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
+        1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
+        1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
+        1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00};
+    static constexpr float hot_color_g[200] = {
+        0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
+        0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
+        0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
+        0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.01, 0.03, 0.04, 0.05, 0.07, 0.08, 0.09, 0.11, 0.12, 0.13, 0.15, 0.16, 0.17, 0.19, 0.20, 0.21, 0.23,
+        0.24, 0.25, 0.27, 0.28, 0.29, 0.31, 0.32, 0.33, 0.35, 0.36, 0.37, 0.39, 0.40, 0.41, 0.43, 0.44, 0.45, 0.47, 0.48, 0.49, 0.51, 0.52, 0.53,
+        0.55, 0.56, 0.57, 0.59, 0.60, 0.61, 0.63, 0.64, 0.65, 0.67, 0.68, 0.69, 0.71, 0.72, 0.73, 0.75, 0.76, 0.77, 0.79, 0.80, 0.81, 0.83, 0.84,
+        0.85, 0.87, 0.88, 0.89, 0.91, 0.92, 0.93, 0.95, 0.96, 0.97, 0.99, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
+        1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00,
+        1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00};
+    static constexpr float hot_color_b[200] = {
+        0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
+        0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
+        0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
+        0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
+        0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
+        0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
+        0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.14, 0.16, 0.18, 0.20, 0.22,
+        0.24, 0.26, 0.28, 0.30, 0.32, 0.34, 0.36, 0.38, 0.40, 0.42, 0.44, 0.46, 0.48, 0.50, 0.52, 0.54, 0.56, 0.58, 0.60, 0.62, 0.64, 0.66, 0.68,
+        0.70, 0.72, 0.74, 0.76, 0.78, 0.80, 0.82, 0.84, 0.86, 0.88, 0.90, 0.92, 0.94, 0.96, 0.98, 1.00};
+
+    const float *src_r = jet_color_r;
+    const float *src_g = jet_color_g;
+    const float *src_b = jet_color_b;
+
+    if (colormap == "hot")
+    {
+        src_r = hot_color_r;
+        src_g = hot_color_g;
+        src_b = hot_color_b;
     }
+
+    std::copy(src_r, src_r + 200, color_r);
+    std::copy(src_g, src_g + 200, color_g);
+    std::copy(src_b, src_b + 200, color_b);
 }
 
 int CGMRF_map::xy2idx(float x, float y) const

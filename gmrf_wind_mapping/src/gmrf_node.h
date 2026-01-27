@@ -38,7 +38,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include <visualization_msgs/msg/marker_array.hpp>
-#include <boost/thread/mutex.hpp>
+#include <mutex>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
 #include <angles/angles.h>
@@ -68,10 +68,6 @@ public:
     double cell_size;
     double exec_freq;
     std::string colormap;
-    int max_pclpoints_cell;
-    double max_sensor_val;
-    double min_sensor_val;
-    double suggest_next_location_sensor_th;
 
     double GMRF_lambdaPrior_reg;               // Weight for regularization prior -> neighbour cells have similar wind vectors
     double GMRF_lambdaPrior_mass_conservation; // Weight for mass conservation law prior
@@ -88,7 +84,7 @@ public:
 
     // Variables
     bool module_init;
-    boost::mutex mutex_anemometer;
+    std::mutex mutex_anemometer;
     double reading_speed;     // m/s
     double reading_direction; // rad
     bool verbose;

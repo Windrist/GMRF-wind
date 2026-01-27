@@ -46,8 +46,8 @@ class CGMRF_map
 {
 public:
     CGMRF_map(rclcpp::Node *_node, const nav_msgs::msg::OccupancyGrid &oc_map, float cell_size, double m_lambdaPrior_reg,
-              double m_lambdaPrior_mass_conservation, double m_lambdaPrior_obstacles, std::string m_colormap, int max_points_cell, bool verbose,
-              bool filter_unexplored = true);
+              double m_lambdaPrior_mass_conservation, double m_lambdaPrior_obstacles, std::string m_colormap,
+              bool verbose, bool filter_unexplored = true);
     ~CGMRF_map();
 
     // insert new observation
