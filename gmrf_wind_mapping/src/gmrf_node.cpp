@@ -194,7 +194,9 @@ void Cgmrf::sensorCallback(const olfaction_msgs::msg::Anemometer::SharedPtr msg)
                     anemometer_upWind_pose.pose.position.x = 0.0;
                     anemometer_upWind_pose.pose.position.y = 0.0;
                     anemometer_upWind_pose.pose.position.z = 0.0;
-                    anemometer_upWind_pose.pose.orientation = Utils::createQuaternionMsgFromYaw(-msg->wind_direction);
+                    anemometer_upWind_pose.pose.orientation =
+                        Utils::createQuaternionMsgFromYaw(
+                            0.5 * M_PI - msg->wind_direction);
 
                     // lookuptransform (target_frame, target_time, pose_in, fixed_frame, pose_out)
                     tf_buffer->transform(anemometer_upWind_pose, map_upWind_pose, frame_id.c_str());
