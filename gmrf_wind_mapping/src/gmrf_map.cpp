@@ -611,7 +611,9 @@ bool CGMRF_map::is_cell_free(size_t id_gmrf)
         return false; // Out of bounds = not free
     }
 
-    return m_Ocgridmap.data[id_oc] < OCCUPANCY_FREE_THRESHOLD;
+    const auto occupancy = m_Ocgridmap.data[id_oc];
+    // Filtered unknown cells must be anchored, not unobserved free components.
+    return occupancy < OCCUPANCY_FREE_THRESHOLD && (!filter_unexplored_ || occupancy >= 0);
 }
 
 /*---------------------------------------------------------------
@@ -1080,7 +1082,7 @@ void CGMRF_map::get_as_markerArray(visualization_msgs::msg::MarkerArray &ma, std
                     marker.pose.position.y = cell_center_y;
                     marker.pose.orientation = Utils::createQuaternionMsgFromYaw(atan2(m_map[i + N].mean, m_map[i].mean));
                     // shape
-                    marker.scale.x = m_resolution * (module / max_module); // arrow length,
+                    marker.scale.x = module; // 1 m of arrow length per 1 m/s; consumers read this as speed
                     marker.scale.y = 0.03;                                 // arrow width
                     marker.scale.z = 0.05;                                 // arrow height
                     // color -> must normalize to [0-199]

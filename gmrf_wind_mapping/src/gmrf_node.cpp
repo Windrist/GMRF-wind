@@ -17,6 +17,10 @@
 #include "Utils.h"
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <limits>
 
 using namespace std::placeholders;
 
@@ -170,80 +174,39 @@ void Cgmrf::initialize()
 //----------------------------------
 void Cgmrf::sensorCallback(const olfaction_msgs::msg::Anemometer::SharedPtr msg)
 {
-    // 1. Get wind measurement
-    double downwind_direction_map = 0.0;
-    double local_speed = 0.0;
+    if (!module_init)
+        return;
 
-    {
-        std::lock_guard<std::mutex> lock(mutex_anemometer);
-        try
-        {
-            local_speed = msg->wind_speed;                     // (m/s)
-            reading_speed = local_speed;
-            reading_direction = msg->wind_direction;           // (rad) This is the Upwind direction with respect the Anemometer ref system (standard measurement)
-
-            // RCLCPP_INFO(get_logger(), "Speed:%f Direction:%f", reading_speed, reading_direction);
-            //  We need to transform this Upwind direction in the Anemometer ref system---- to ---- DownWind direction in the MAP ref system
-            if (local_speed != 0.0)
-            {
-                // Transform from anemometer ref_system to the map ref_system using TF
-                geometry_msgs::msg::PoseStamped anemometer_upWind_pose, map_upWind_pose;
-                try
-                {
-                    anemometer_upWind_pose.header = msg->header;
-                    anemometer_upWind_pose.pose.position.x = 0.0;
-                    anemometer_upWind_pose.pose.position.y = 0.0;
-                    anemometer_upWind_pose.pose.position.z = 0.0;
-                    anemometer_upWind_pose.pose.orientation =
-                        Utils::createQuaternionMsgFromYaw(
-                            0.5 * M_PI - msg->wind_direction);
-
-                    // lookuptransform (target_frame, target_time, pose_in, fixed_frame, pose_out)
-                    tf_buffer->transform(anemometer_upWind_pose, map_upWind_pose, frame_id.c_str());
-
-                    downwind_direction_map = angles::normalize_angle(Utils::getYaw(map_upWind_pose.pose.orientation) + M_PI);
-                }
-                catch (const tf2::TransformException &ex)
-                {
-                    RCLCPP_ERROR(get_logger(), "[GMRF] Transform error: %s", ex.what());
-                    return; // Exit early if transform fails
-                }
-            }
-        }
-        catch (const std::exception &e)
-        {
-            RCLCPP_ERROR(get_logger(), "[GMRF] Exception at new Obs: %s", e.what());
-            return;
-        }
-    } // lock released here
-
-    // RCLCPP_INFO(get_logger(), "[GMRF-node] New wind observation! %.2f m/s  %.2f rad (DownWind in the map ref system)",msg->wind_speed,
-    // downwind_direction_map);
-
-    // 2. Get pose of the sensor in the map reference system
+    // Use the same timestamped transform for sensor position and flow direction.
+    // The TF listener runs on its own thread; wait briefly when TF trails the sample.
     geometry_msgs::msg::TransformStamped transform;
     try
     {
-        // lookuptransform (target_frame, source_frame, result_tf)
-        transform = tf_buffer->lookupTransform(frame_id.c_str(), msg->header.frame_id.c_str(), msg->header.stamp);
+        transform = tf_buffer->lookupTransform(
+            frame_id, msg->header.frame_id, msg->header.stamp,
+            tf2::Duration(std::chrono::milliseconds(100)));
     }
     catch (const tf2::TransformException &ex)
     {
         RCLCPP_ERROR(get_logger(), "[GMRF] Exception reading observation: %s", ex.what());
-        return; // Exit early if we can't get sensor pose
+        return;
     }
 
-    // 3. Add observation to the GMRF map
-    if (module_init)
+    const double speed = msg->wind_speed;
+    double downwind_direction_map = 0.0;
+    if (speed != 0.0)
     {
-        // Current sensor pose in the map
-        float x_pos = transform.transform.translation.x;
-        float y_pos = transform.transform.translation.y;
-
-        std::lock_guard<std::mutex> lock(mutex_anemometer);
-        // RCLCPP_INFO(get_logger(), "[GMRF] New obs: %.2f m/s, %.2f rad at (%.2f,%.2f)", reading_speed,reading_direction,x_pos,y_pos);
-        my_map->insertObservation_GMRF(local_speed, downwind_direction_map, x_pos, y_pos, GMRF_lambdaObs);
+        geometry_msgs::msg::PoseStamped upwind_sensor, upwind_map;
+        upwind_sensor.header = msg->header;
+        upwind_sensor.pose.orientation = Utils::createQuaternionMsgFromYaw(
+            0.5 * M_PI - msg->wind_direction);
+        tf2::doTransform(upwind_sensor, upwind_map, transform);
+        downwind_direction_map = angles::normalize_angle(
+            Utils::getYaw(upwind_map.pose.orientation) + M_PI);
     }
+    my_map->insertObservation_GMRF(
+        speed, downwind_direction_map, transform.transform.translation.x,
+        transform.transform.translation.y, GMRF_lambdaObs);
 }
 
 void Cgmrf::publishMaps()
@@ -307,11 +270,19 @@ int main(int argc, char **argv)
     auto service = my_gmrf_map->create_service<WindEstimation>("WindEstimation", std::bind(&Cgmrf::get_wind_value_srv, my_gmrf_map.get(), _1, _2));
     RCLCPP_INFO(my_gmrf_map->get_logger(), "[gmrf] LOOP....");
     rclcpp::Time last_publication_time = my_gmrf_map->now();
-    rclcpp::Rate loop_rate(my_gmrf_map->exec_freq);
-
-    while (rclcpp::ok())
+    const double frequency = my_gmrf_map->exec_freq;
+    const double period_ns = 1e9 / frequency;
+    if (!std::isfinite(frequency) || frequency <= 0.0 || !std::isfinite(period_ns) ||
+        period_ns < 1.0 || period_ns >= static_cast<double>(std::numeric_limits<int64_t>::max()))
     {
-        rclcpp::spin_some(my_gmrf_map); // Callbacks & Services
+        RCLCPP_ERROR(my_gmrf_map->get_logger(), "exec_freq must define a finite positive timer period");
+        rclcpp::shutdown();
+        return 1;
+    }
+    // Drain subscriptions continuously; only the solve is limited to exec_freq.
+    auto timer = my_gmrf_map->create_wall_timer(
+        std::chrono::nanoseconds(static_cast<int64_t>(period_ns)), [&]()
+    {
 
         if (my_gmrf_map->module_init)
         {
@@ -330,6 +301,7 @@ int main(int argc, char **argv)
             if (my_gmrf_map->verbose)
                 RCLCPP_INFO(my_gmrf_map->get_logger(), "[gmrf] Waiting for initialization (Map of environment).");
         }
-        loop_rate.sleep();
-    }
+    });
+    rclcpp::spin(my_gmrf_map);
+    rclcpp::shutdown();
 }

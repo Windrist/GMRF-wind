@@ -38,7 +38,6 @@
 #include "rclcpp/rclcpp.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include <visualization_msgs/msg/marker_array.hpp>
-#include <mutex>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
 #include <angles/angles.h>
@@ -84,9 +83,6 @@ public:
 
     // Variables
     bool module_init;
-    std::mutex mutex_anemometer;
-    double reading_speed;     // m/s
-    double reading_direction; // rad
     bool verbose;
 
 protected:
