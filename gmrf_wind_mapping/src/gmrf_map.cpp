@@ -681,7 +681,8 @@ bool CGMRF_map::check_connectivity_between2cells(size_t idx_1_gmrf, size_t idx_2
     {
         for (size_t p = idx_1_oc; p < static_cast<size_t>(idx_2_oc); p++)
         {
-            if (p >= map_size) return false;
+            if (p >= map_size)
+                return false;
             if (m_Ocgridmap.data[p] >= OCCUPANCY_OBSTACLE_THRESHOLD_H)
             {
                 return false;
@@ -692,7 +693,8 @@ bool CGMRF_map::check_connectivity_between2cells(size_t idx_1_gmrf, size_t idx_2
     {
         for (size_t p = idx_1_oc; p < static_cast<size_t>(idx_2_oc); p += m_Ocgridmap.info.width)
         {
-            if (p >= map_size) return false;
+            if (p >= map_size)
+                return false;
             if (m_Ocgridmap.data[p] >= OCCUPANCY_OBSTACLE_THRESHOLD_V)
             {
                 return false;
@@ -1083,8 +1085,8 @@ void CGMRF_map::get_as_markerArray(visualization_msgs::msg::MarkerArray &ma, std
                     marker.pose.orientation = Utils::createQuaternionMsgFromYaw(atan2(m_map[i + N].mean, m_map[i].mean));
                     // shape
                     marker.scale.x = module; // 1 m of arrow length per 1 m/s; consumers read this as speed
-                    marker.scale.y = 0.03;                                 // arrow width
-                    marker.scale.z = 0.05;                                 // arrow height
+                    marker.scale.y = 0.03;   // arrow width
+                    marker.scale.z = 0.05;   // arrow height
                     // color -> must normalize to [0-199]
                     size_t idx_color = 199 * (module / max_module);
                     marker.color.r = color_r[idx_color];
@@ -1103,7 +1105,7 @@ void CGMRF_map::get_as_markerArray(visualization_msgs::msg::MarkerArray &ma, std
 void CGMRF_map::save_grmf_factor_graph(std::vector<Eigen::Triplet<double>> &Jout, std::vector<Eigen::Triplet<double>> &Aout, Eigen::VectorXd &yout)
 {
     // Get output directory from environment or use /tmp as fallback
-    const char* home_dir = std::getenv("HOME");
+    const char *home_dir = std::getenv("HOME");
     std::string output_dir = home_dir ? std::string(home_dir) : "/tmp";
 
     bool save_dense = true;
@@ -1183,7 +1185,7 @@ void CGMRF_map::save_grmf_factor_graph(std::vector<Eigen::Triplet<double>> &Jout
 void CGMRF_map::save_grmf_factor_graph(Eigen::SparseMatrix<double> &H, Eigen::VectorXd &G)
 {
     // Get output directory from environment or use /tmp as fallback
-    const char* home_dir = std::getenv("HOME");
+    const char *home_dir = std::getenv("HOME");
     std::string output_dir = home_dir ? std::string(home_dir) : "/tmp";
 
     // 1. Hessian

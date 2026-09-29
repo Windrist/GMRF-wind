@@ -3,20 +3,20 @@
 <package format="3">
   <name>gmrf_wind_mapping</name>
   <version>0.0.0</version>
-  <description>This packages estimates the average windflow present in an environment from a set of 2D anemometer measurements.
-               The implementation is based on Gaussian Markov Random Fields</description>
+  <description>This packages estimates the average windflow present in an environment from a set of
+    2D anemometer measurements. The implementation is based on Gaussian Markov Random Fields</description>
   <maintainer email="jgmonroy@uma.es">Javier G Monroy</maintainer>
 
   <license>GPLv3</license>
-  <author>Javier G. Monroy</author>  
+  <author>Javier G. Monroy</author>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
-    
+
   <!-- Dependencies needed to compile this package. -->
   <build_depend>rclcpp</build_depend>
   <build_depend>gmrf_msgs</build_depend>
   <build_depend>std_msgs</build_depend>
-  <build_depend>geometry_msgs</build_depend>  
+  <build_depend>geometry_msgs</build_depend>
   <build_depend>sensor_msgs</build_depend>
   <build_depend>visualization_msgs</build_depend>
   <build_depend>olfaction_msgs</build_depend>

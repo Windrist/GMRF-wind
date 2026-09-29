@@ -9,7 +9,7 @@
 namespace Utils
 {
 
-    inline double getYaw(const geometry_msgs::msg::Quaternion& quat)
+    inline double getYaw(const geometry_msgs::msg::Quaternion &quat)
     {
         tf2::Quaternion tfquat;
         tf2::fromMsg(quat, tfquat);
@@ -25,7 +25,7 @@ namespace Utils
         return tf2::toMsg(tf2::Quaternion(tf2::Vector3(0, 0, 1), yaw));
     }
 
-    inline nav_msgs::msg::OccupancyGrid parseMapImage(const std::string& path)
+    inline nav_msgs::msg::OccupancyGrid parseMapImage(const std::string &path)
     {
         if (!std::filesystem::exists(path))
         {

@@ -282,7 +282,7 @@ int main(int argc, char **argv)
     // Drain subscriptions continuously; only the solve is limited to exec_freq.
     auto timer = my_gmrf_map->create_wall_timer(
         std::chrono::nanoseconds(static_cast<int64_t>(period_ns)), [&]()
-    {
+        {
 
         if (my_gmrf_map->module_init)
         {
@@ -300,8 +300,7 @@ int main(int argc, char **argv)
         {
             if (my_gmrf_map->verbose)
                 RCLCPP_INFO(my_gmrf_map->get_logger(), "[gmrf] Waiting for initialization (Map of environment).");
-        }
-    });
+        } });
     rclcpp::spin(my_gmrf_map);
     rclcpp::shutdown();
 }
